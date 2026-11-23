@@ -943,10 +943,18 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   const connectionDescription = (): string => {
     const state = `SSH remote: ${remote ? "connected" : "disconnected"}; tool routing: ${routeRemoteTools ? "remote" : "local"}.`;
-    // While disconnected the prompt carries only this non-actionable status line: the remembered route
-    // belongs to the user's /remote command, not to the model (#13).
-    if (!remote) return state;
-    return `${state}\nSSH command: ${remote.command}\nRemote cwd: ${remote.cwd}\nResume: remote(action="reconnect")`;
+    if (remote) {
+      const where = routeRemoteTools
+        ? `Tools run on the remote (cwd: ${remote.cwd}).`
+        : `Remote is connected, but tools currently route locally.`;
+      return `${state}\n${where}\nSSH command: ${remote.command}`;
+    }
+    // Disconnected with a remembered route: name the route and offer reconnect, so a host that
+    // resumed a connected workspace, or an agent doing remote work, knows tools run locally and
+    // that it must reconnect to reach the remote. No route is shown when there is none to remember.
+    if (!lastCommand) return state;
+    const cwd = lastCwd ?? configuredCwd(lastCommand);
+    return `${state}\nTools run locally; remote ${lastCommand} (cwd: ${cwd}) is not connected. If your task needs the remote, reconnect with the remote tool.`;
   };
 
   const connectionResult = (summary: string, extra: Record<string, unknown> = {}) => ({
@@ -1860,12 +1868,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (["disconnect", "off", "exit"].includes(action)) { disconnect(ctx); return; }
       if (action === "forget") { disconnect(ctx, true); return; }
       if (action === "status") {
-        // The prompt section stays command-free while disconnected; the user's own status view still
-        // names the route that a bare /remote would reconnect to.
-        const remembered = !remote && lastCommand
-          ? `\nRemembered route: ${lastCommand}\nRemote cwd: ${lastCwd ?? configuredCwd(lastCommand)}\nReconnect: /remote or remote(action="reconnect")`
-          : "";
-        ctx.ui.notify(`${connectionDescription()}${remembered}`, "info");
+        // connectionDescription() already names the route and reconnect option while disconnected,
+        // so the status view reuses it and only adds the user-facing /remote slash hint.
+        const reconnectHint = !remote && lastCommand ? `\nReconnect: /remote or remote(action="reconnect")` : "";
+        ctx.ui.notify(`${connectionDescription()}${reconnectHint}`, "info");
         return;
       }
       if (["reload", "reconnect"].includes(action)) {
