@@ -142,6 +142,10 @@ const MIN_MODEL_OUTPUT_BYTES = 1024;
 const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
+// Bounds interactive dialogs (secret prompts, host-key trust, command input) on
+// non-interactive hosts such as RPC: the host may never answer, and an unbounded
+// wait would otherwise wedge the process. See askSecret / connectRoute / session_start.
+const NON_INTERACTIVE_DIALOG_TIMEOUT_MS = 30_000;
 const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 const REMOTE_FILE_TOOL_ROUTING_DESCRIPTION = "With SSH routing active, this tool operates directly on the remote workspace.";
@@ -908,7 +912,7 @@ class SecretInput implements Component, Focusable {
 }
 
 async function askSecret(ctx: any, label: string, placeholder: string): Promise<string | null> {
-  if (ctx.mode !== "tui") return (await ctx.ui.input(`${label}:`, placeholder)) ?? null;
+  if (ctx.mode !== "tui") return (await ctx.ui.input(`${label}:`, placeholder, { timeout: NON_INTERACTIVE_DIALOG_TIMEOUT_MS })) ?? null;
   return ctx.ui.custom<string | null>((tui: any, _theme: any, _keys: any, done: (value: string | null) => void) =>
     new SecretInput(label, done, () => tui.requestRender()));
 }
@@ -1121,6 +1125,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
               fingerprint
                 ? `${hop.label}\nPrevious key: ${displayFingerprint(fingerprint)}\nNew key: ${displayFingerprint(probed)}\nVerify the server identity. Update the saved key and continue?`
                 : `${hop.label}\nHost key: ${displayFingerprint(probed)}\nTrust and save this key?`,
+              ctx.mode !== "tui" ? { timeout: NON_INTERACTIVE_DIALOG_TIMEOUT_MS } : undefined,
             );
             if (!trusted) throw new Error(`The host key for ${hop.label} was not trusted`);
             saveKnownHost(key, probed);
@@ -1350,10 +1355,19 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return running;
   };
 
-  const restoreSessionRemoteState = async (saved: SessionRemoteState, ctx: any): Promise<void> => {
+  const restoreSessionRemoteState = async (saved: SessionRemoteState, ctx: any, interactive = true): Promise<void> => {
     lastCommand = saved.command ?? "";
     lastCwd = saved.cwd;
     if (!saved.connected) {
+      credentialCache.resume = undefined;
+      status(ctx);
+      return;
+    }
+    if (!interactive) {
+      // A non-interactive host cannot answer a secret prompt, so a remembered
+      // connection is not re-established on load; tools stay local until the
+      // user reconnects interactively. The stored route is left intact so an
+      // interactive resume still restores it.
       credentialCache.resume = undefined;
       status(ctx);
       return;
@@ -1874,7 +1888,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           await connectInteractive(selected, ctx);
           return;
         }
-        const prompted = await ctx.ui.input("SSH command:", lastCommand);
+        const prompted = await ctx.ui.input("SSH command:", lastCommand, ctx.mode !== "tui" ? { timeout: NON_INTERACTIVE_DIALOG_TIMEOUT_MS } : undefined);
         if (!prompted) return;
         await connectInteractive(prompted, ctx);
         return;
@@ -1913,7 +1927,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     restoringSessionState = true;
     try {
-      await restoreSessionRemoteState(target, ctx);
+      await restoreSessionRemoteState(target, ctx, ctx.mode === "tui");
     } catch (error) {
       ctx.ui.notify(`SSH remote session restore failed: ${(error as Error).message.split("\n")[0]}`, "error");
     } finally {

@@ -16,7 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Fixed
 
-- None.
+- Don't re-establish a remembered SSH connection when the host is non-interactive (for example an RPC embedding that resumes a session); the route is now remembered but left disconnected until the user reconnects interactively, so loading such a session no longer hangs on a private-key passphrase or password prompt.
+- Bound secret, host-key trust, and bare `/remote` command prompts to 30s on non-interactive hosts instead of waiting indefinitely, so an unanswered dialog fails fast instead of wedging the process.
 
 ## [0.1.16] - 2026-11-12
 
