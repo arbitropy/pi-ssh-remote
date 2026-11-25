@@ -45,8 +45,13 @@ import {
   unknownProjectMessage, validateProjectName, type Catalog, type ForwardSpec, type ProjectFields,
 } from "./src/catalog.ts";
 import {
-  ensureProjectMemory, formatMemoryEntries, loadProjectMemory, memoryContext, migrateMemories, projectMemoryPath, serverIdsForSsh,
+  ensureProjectMemory, formatMemoryEntries, loadProjectMemory, migrateMemories, projectMemoryPath, projectMemorySnapshot, serverIdsForSsh,
 } from "./src/memory.ts";
+import {
+  buildContextScript, CONTEXT_FETCH_TIMEOUT_SECONDS, CONTEXT_MAX_AGE_MS, CONTEXT_PROMPT_TIMEOUT_MS, CONTEXT_RETRY_BACKOFF_MS, contextSummary,
+  formatSwitchContext, instructionLabel, newDelimiter, parseContextOutput, renderInstructionBlocks, sameInstructionPaths, toContextFiles,
+  type InstructionFile, type MemorySnapshot,
+} from "./src/context.ts";
 import {
   abortedError, DEFAULT_REMOTE_TIMEOUT_SECONDS, execRemote, execRemoteLimited, isDirectoryMode, isReconnectable, limitRemoteToolResult,
   MAX_REMOTE_TIMEOUT_SECONDS, missingAsFalse, openAbortableExec, parseRemoteTimeout, remoteCommandLine, REMOTE_SEARCH_TIMEOUT_SECONDS,
@@ -54,7 +59,7 @@ import {
   OUTPUT_FOOTER_RESERVE_BYTES,
 } from "./src/exec.ts";
 import { createKnownHosts, createPool, resolveCwd, type ConnectUi, type PoolConn } from "./src/pool.ts";
-import { focusLabel, formatProjectList, memoryManagementPrompt, remotePrompt, renderPromptSections, type RemoteView } from "./src/prompt.ts";
+import { focusLabel, formatProjectList, projectMemorySection, remotePrompt, renderPromptSections, type RemoteView } from "./src/prompt.ts";
 import { parseSessionState, SESSION_STATE_ENTRY_TYPE, type SessionState } from "./src/session.ts";
 import { askSecret, NON_INTERACTIVE_DIALOG_TIMEOUT_MS, previewRemoteOutput, renderRemoteControlCall, renderRemoteControlResult } from "./src/render.ts";
 import { remoteArgumentCompletions, suppressRemoteCompletionsBeforeSuffix } from "./src/complete.ts";
@@ -66,7 +71,11 @@ interface SessionProject {
   connected: boolean;
   key?: string;
   parsed?: ParsedSsh;
+  /** Why the last project-instruction refresh failed; cleared by the next success. */
+  contextError?: string;
 }
+
+interface ContextEntry { files: InstructionFile[]; fetchedAt: number }
 
 interface ForwardEntry { project: string; spec: ForwardSpec; server: Server }
 
@@ -88,6 +97,7 @@ interface PromptSectionHost {
   systemPromptOptions?: {
     cwd?: string;
     sections?: Record<string, string>;
+    contextFiles?: { path: string; content: string }[];
   };
 }
 
@@ -97,7 +107,6 @@ const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const MEMORY_DIR = join(AGENT_DIR, "ssh-remote-memories");
 const CACHE_KEY = "__piHpcCredentialCacheV1";
-const MEMORY_MESSAGE_TYPES = ["ssh-remote-server-memory", "ssh-remote-project-memory"];
 const FILE_ROUTING = "When the focus is a remote project, this tool operates on that project.";
 const SHELL_ROUTING = "When the focus is a remote project, this tool runs in that project.";
 const REMOTE_ACTIONS = ["list", "add", "edit", "remove", "connect", "disconnect", "focus", "status", "chdir", "memory", "forward", "unforward", "exec", "forget"] as const;
@@ -120,6 +129,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const session: SessionProject[] = [];
   const forwards = new Map<number, ForwardEntry>();
   const reconnecting = new Map<string, Promise<PoolConn>>();
+  // Remote instruction files per (project, session cwd), when each fetch was attempted, and fetches in flight.
+  const contextCache = new Map<string, ContextEntry>();
+  const contextAttempts = new Map<string, number>();
+  const contextFetches = new Map<string, Promise<ContextEntry>>();
   let focus = LOCAL_FOCUS;
   let currentCtx: any;
   let sessionReady = false;
@@ -221,6 +234,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       }
       status();
       persistSessionState();
+      for (const project of connectedUsing(key)) void loadContext(project, conn.client); // in the background; never fails
       if (currentCtx) {
         const names = connectedUsing(key).map((p) => p.name).join(", ");
         currentCtx.ui.notify(notes.length ? `SSH remote reconnected (${names}); ${notes.join("; ")}` : `SSH remote reconnected automatically: ${names}`, notes.length ? "warning" : "info");
@@ -260,6 +274,90 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
   };
 
+  // ---- project context: remote instruction files + project memory --------------------------------------
+
+  const contextKey = (rt: SessionProject): string => `${rt.name}\0${rt.cwd}`;
+  const cachedInstructions = (rt: SessionProject): InstructionFile[] => contextCache.get(contextKey(rt))?.files ?? [];
+  const dropContext = (name: string): void => {
+    for (const key of [...contextCache.keys()]) if (key.startsWith(`${name}\0`)) contextCache.delete(key);
+  };
+
+  // One round trip: a POSIX sh script prints every applicable AGENTS.md/CLAUDE.md. Concurrent callers for the
+  // same (project, cwd) share one fetch. A failure rejects and leaves the previous cache entry in place.
+  const refreshContext = (rt: SessionProject, client: SshClient, timeoutSeconds = CONTEXT_FETCH_TIMEOUT_SECONDS): Promise<ContextEntry> => {
+    const key = contextKey(rt);
+    const inflight = contextFetches.get(key);
+    if (inflight) return inflight;
+    const fetch = (async () => {
+      contextAttempts.set(key, Date.now());
+      const delimiter = newDelimiter();
+      // execRemote has no timer until the channel opens; the deadline also covers a remote that never answers.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const output = await Promise.race([
+        execRemote(client, buildContextScript(rt.cwd, delimiter), false, timeoutSeconds),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`remote did not answer within ${timeoutSeconds + 2} seconds`)), (timeoutSeconds + 2) * 1000); }),
+      ]).finally(() => clearTimeout(timer));
+      const entry = { files: parseContextOutput(output, delimiter), fetchedAt: Date.now() };
+      contextCache.set(key, entry);
+      return entry;
+    })().finally(() => contextFetches.delete(key));
+    contextFetches.set(key, fetch);
+    return fetch;
+  };
+
+  /** Refreshes the project's instruction files; never throws. A failure is kept in `rt.contextError` and the stale cache stays. */
+  const loadContext = async (rt: SessionProject, client?: SshClient): Promise<void> => {
+    try {
+      if (client) await refreshContext(rt, client);
+      else await withReconnect(rt, (live) => refreshContext(rt, live));
+      rt.contextError = undefined;
+    } catch (error) {
+      rt.contextError = firstLine((error as Error).message);
+    }
+  };
+
+  // Used by before_agent_start: refreshes a context older than five minutes, but waits at most five seconds,
+  // never reconnects, never prompts, and keeps the stale cache on any failure. A fetch that is still running
+  // (a hung remote) is not waited on again.
+  const ensureFreshContext = async (rt: SessionProject): Promise<InstructionFile[]> => {
+    const key = contextKey(rt);
+    const entry = contextCache.get(key);
+    const client = rt.key ? pool.get(rt.key)?.client : undefined;
+    const now = Date.now();
+    const due = !entry || now - entry.fetchedAt > CONTEXT_MAX_AGE_MS;
+    if (due && client && !contextFetches.has(key) && now - (contextAttempts.get(key) ?? 0) > CONTEXT_RETRY_BACKOFF_MS) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          refreshContext(rt, client, CONTEXT_PROMPT_TIMEOUT_MS / 1000).then(
+            () => { rt.contextError = undefined; },
+            (error) => { rt.contextError = firstLine((error as Error).message); },
+          ),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, CONTEXT_PROMPT_TIMEOUT_MS); }),
+        ]);
+      } catch { /* keep the stale cache */ }
+      finally { clearTimeout(timer); }
+    }
+    return cachedInstructions(rt);
+  };
+
+  const memorySnapshot = (name: string, ssh?: string): MemorySnapshot => {
+    try { ensureProjectMemory(MEMORY_DIR, name, ssh); }
+    catch { /* the snapshot still names the path; the model can create the file */ }
+    return projectMemorySnapshot(MEMORY_DIR, name);
+  };
+
+  /** Text appended to a connect/focus tool result: the project's instructions and memory, visible in the transcript. */
+  const switchContextText = (rt: SessionProject): string =>
+    formatSwitchContext(rt.name, cachedInstructions(rt), memorySnapshot(rt.name, catalog().projects[rt.name]?.ssh), { fetchError: rt.contextError });
+
+  /** One-line summary for the /remote connect and /remote focus commands. */
+  const contextNotice = (rt: SessionProject): { text: string; level: "info" | "warning" } => {
+    const memory = memorySnapshot(rt.name, catalog().projects[rt.name]?.ssh);
+    if (rt.contextError) return { text: `Could not load project instructions for ${rt.name}: ${rt.contextError}`, level: "warning" };
+    return { text: memory.error ? `${contextSummary(rt.name, cachedInstructions(rt), 0)} (memory file is invalid: ${memory.error})` : contextSummary(rt.name, cachedInstructions(rt), memory.entries.length), level: memory.error ? "warning" : "info" };
+  };
+
   /** Connects (or re-connects) a catalog project, adds it to the session, and by default focuses it. */
   const connectProject = async (name: string, ctx: any, options: { focus?: boolean } = {}): Promise<SessionProject> => {
     currentCtx = ctx;
@@ -275,6 +373,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         status(ctx);
         persistSessionState();
         ctx.ui.notify(`SSH remote ${name} is already connected; focus set to it`, "info");
+        await loadContext(rt);
       }
       return rt;
     }
@@ -298,6 +397,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     ctx.ui.notify(resolved.unavailableCwd
       ? `SSH remote directory unavailable: ${resolved.unavailableCwd}; connected ${name} in default directory ${resolved.cwd}`
       : `SSH remote connected: ${describe(rt, projects.projects)}`, resolved.unavailableCwd ? "warning" : "info");
+    await loadContext(rt);
     return rt;
   };
 
@@ -307,10 +407,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     persistSessionState();
   };
 
-  const focusProject = async (name: string, ctx: any): Promise<string> => {
+  /** Switches the focus; returns the project, or undefined for local. A disconnected project is reconnected first. */
+  const focusProject = async (name: string, ctx: any): Promise<SessionProject | undefined> => {
     if (name === LOCAL_FOCUS) {
       setFocus(LOCAL_FOCUS, ctx);
-      return "Focus: local";
+      return undefined;
     }
     const rt = findSession(name);
     if (!rt) {
@@ -320,8 +421,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         : unknownProjectMessage(projects, name));
     }
     if (!rt.connected) await connectProject(name, ctx);
-    else setFocus(name, ctx);
-    return `Focus: ${describe(rt)}`;
+    else {
+      setFocus(name, ctx);
+      await loadContext(rt);
+    }
+    return rt;
   };
 
   const disconnectProject = async (name: string, ctx: any, forgetCredentials = false): Promise<void> => {
@@ -330,6 +434,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (!rt && !(forgetCredentials && parsed)) throw new Error(`Project "${name}" is not in this session`);
     if (rt) {
       rt.connected = false;
+      dropContext(name);
       await stopForwards(name);
       closeIfUnused(rt.key);
       if (focus === name) focus = LOCAL_FOCUS;
@@ -346,6 +451,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const rt = findSession(name);
     if (rt) {
       rt.connected = false;
+      dropContext(name);
       await stopForwards(name);
       closeIfUnused(rt.key);
       session.splice(session.indexOf(rt), 1);
@@ -364,6 +470,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     rt.cwd = resolved;
     status(ctx);
     persistSessionState();
+    await loadContext(rt);
     return resolved;
   };
 
@@ -747,11 +854,24 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     const more = Object.keys(projects).filter((name) => !findSession(name)).length;
     if (more) lines.push(`${more} more saved: remote(action="list")`);
+    const focused = focusedProject();
+    if (focused?.connected) {
+      const files = cachedInstructions(focused);
+      const memory = memorySnapshot(focused.name, projects[focused.name]?.ssh);
+      const fetchedAt = contextCache.get(contextKey(focused))?.fetchedAt;
+      lines.push(
+        `Project instructions (${focused.name}): ${files.length ? files.map((file) => instructionLabel(focused.name, file.path)).join(", ") : "none loaded"}${fetchedAt ? ` (fetched ${Math.round((Date.now() - fetchedAt) / 1000)}s ago)` : ""}${focused.contextError ? `; last refresh failed: ${focused.contextError}` : ""}`,
+        `Project memory (${focused.name}): ${memory.error ? `invalid JSON (${memory.error})` : `${memory.entries.length} ${memory.entries.length === 1 ? "entry" : "entries"}`}; ${memory.path}`,
+      );
+    }
     return lines.join("\n");
   };
 
-  const actionResult = (summary: string, details: Record<string, unknown> = {}) => ({
-    content: [{ type: "text" as const, text: `${summary}\nFocus: ${focusLabel(view())}` }],
+  const contextDetails = (rt: SessionProject) => ({ instructions: cachedInstructions(rt).map((file) => instructionLabel(rt.name, file.path)) });
+
+  // Every result built here ends with exactly one `Focus:` line; `extra` (project context) goes before it.
+  const actionResult = (summary: string, details: Record<string, unknown> = {}, extra = "") => ({
+    content: [{ type: "text" as const, text: [summary, extra, `Focus: ${focusLabel(view())}`].filter(Boolean).join("\n") }],
     details: { summary, focus, ...details },
   });
 
@@ -865,11 +985,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         case "connect": {
           if (!params.name) throw new Error("connect requires name");
           const rt = await connectProject(params.name, ctx);
-          return actionResult(`Connected: ${describe(rt)}`);
+          return actionResult(`Connected: ${describe(rt)}`, contextDetails(rt), switchContextText(rt));
         }
         case "focus": {
           if (!params.name) throw new Error('focus requires name (a session project or "local")');
-          return actionResult(await focusProject(params.name, ctx));
+          const rt = await focusProject(params.name, ctx);
+          return rt
+            ? actionResult(`Tools now run on ${describe(rt)}.`, contextDetails(rt), switchContextText(rt))
+            : actionResult("Tools now run on this machine.");
         }
         case "disconnect": {
           const name = params.name ?? (focus !== LOCAL_FOCUS ? focus : undefined);
@@ -886,8 +1009,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         case "chdir": {
           if (!params.cwd) throw new Error("cwd is required for chdir");
           const rt = requireConnected(sessionTarget(params.name, "change directory for"));
+          const before = cachedInstructions(rt);
           const resolved = await changeCwd(rt, params.cwd, ctx);
-          return { content: [{ type: "text", text: `${rt.name} working directory: ${resolved}` }], details: { project: rt.name, cwd: resolved } };
+          const after = cachedInstructions(rt);
+          let extra = "";
+          if (rt.contextError) extra = `Project instructions for ${rt.name} could not be refreshed for ${resolved}: ${rt.contextError}`;
+          else if (!sameInstructionPaths(before, after)) extra = after.length ? formatSwitchContext(rt.name, after, undefined) : `No project instructions found for ${resolved}.`;
+          return { content: [{ type: "text", text: [`${rt.name} working directory: ${resolved}`, extra].filter(Boolean).join("\n") }], details: { project: rt.name, cwd: resolved, ...contextDetails(rt) } };
         }
         case "memory": {
           const name = params.name ?? (focus !== LOCAL_FOCUS ? focus : undefined);
@@ -995,12 +1123,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           }
           case "connect": {
             if (!rest) throw new Error("Usage: /remote connect NAME");
-            await connectProject(rest, ctx);
-            return;
+            const rt = await connectProject(rest, ctx);
+            const notice = contextNotice(rt);
+            return ctx.ui.notify(notice.text, notice.level);
           }
           case "focus": {
             if (!rest) throw new Error("Usage: /remote focus NAME|local");
-            return info(await focusProject(rest, ctx));
+            const rt = await focusProject(rest, ctx);
+            if (!rt) return info("Focus: local");
+            const notice = contextNotice(rt);
+            return ctx.ui.notify(`Focus: ${describe(rt)}. ${notice.text}`, notice.level);
           }
           case "disconnect": {
             const name = rest || (focus !== LOCAL_FOCUS ? focus : "");
@@ -1062,8 +1194,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
               projects.projects[name] = { ssh, cwd: HOME_CWD };
               saveCatalog(CONFIG_FILE, projects);
             }
-            await connectProject(name, ctx);
-            return;
+            const rt = await connectProject(name, ctx);
+            const notice = contextNotice(rt);
+            return ctx.ui.notify(notice.text, notice.level);
           }
           case "config": {
             const outputConfig = rest.match(/^(display-lines|read-max-lines|read-max-bytes|exec-max-lines|exec-max-bytes|turn-max-bytes)\s+(\S+)$/i);
@@ -1165,6 +1298,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     await stopForwards();
     for (const project of session) project.connected = false;
+    contextCache.clear();
+    contextAttempts.clear();
     pool.closeAll();
   });
   pi.on("user_bash", async (event, ctx) => {
@@ -1184,27 +1319,37 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return failure((error as Error).message);
     }
   });
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event) => {
     const host = event as unknown as PromptSectionHost;
     const sections: Record<string, string> = {};
     const projects = catalog().projects;
     sections.ssh_remote = remotePrompt(view(projects));
-    const focused = focusedProject();
+    // Project context (remote instruction files and project memory) is added only while the focus is a connected
+    // remote project. Nothing here may throw or wait on the user: failures leave the prompt without that part.
+    const focused = focusedProject()?.connected ? focusedProject() : undefined;
+    let instructions: InstructionFile[] = [];
     if (focused) {
-      let path = projectMemoryPath(MEMORY_DIR, focused.name);
-      try { path = ensureProjectMemory(MEMORY_DIR, focused.name, projects[focused.name]?.ssh); }
-      catch { /* the prompt still names the path; the model can create the file */ }
-      sections.ssh_remote_memory_management = memoryManagementPrompt(path, focused.name);
+      try { sections.ssh_remote_project_memory = projectMemorySection(focused.name, memorySnapshot(focused.name, projects[focused.name]?.ssh)); }
+      catch { /* the prompt goes ahead without the memory section */ }
+      try { instructions = await ensureFreshContext(focused); }
+      catch { /* keep going without instruction files */ }
     }
     const options = host.systemPromptOptions;
     if (options?.sections) {
       Object.assign(options.sections, sections);
-      if (focused?.connected) options.cwd = focused.cwd;
+      if (focused) {
+        options.cwd = focused.cwd;
+        // Keep the local files: the local project stays relevant. Remote ones are labelled ssh://<project>/<path>.
+        options.contextFiles = [...(options.contextFiles ?? []), ...toContextFiles(focused.name, instructions)];
+      }
       return undefined;
     }
     // Hosts that start the agent without structured prompt options (for example omp, which loads
     // Pi extensions through a legacy Pi shim) expose only the rendered system prompt and replace it
     // wholesale with the blocks they handed out. Append the same sections as tagged blocks.
+    if (focused && instructions.length) {
+      sections.ssh_remote_project_instructions = `Project instructions for ${focused.name} (apply while working on this project):\n${renderInstructionBlocks(focused.name, instructions)}`;
+    }
     const blocks = renderPromptSections(sections);
     if (blocks.length === 0) return undefined;
     const rendered = host.systemPrompt;
@@ -1215,21 +1360,5 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         : undefined;
     // The Pi handler contract declares a string prompt; those hosts accept the block array.
     return systemPrompt === undefined ? undefined : { systemPrompt } as unknown as BeforeAgentStartEventResult;
-  });
-  pi.on("context", (event) => {
-    const focused = focusedProject();
-    const content = focused ? memoryContext(MEMORY_DIR, focused.name) : undefined;
-    // Drop the previous turn's memory message first so a focus change never leaves another project's memory behind.
-    const kept = event.messages.filter((message) => message.role !== "custom" || !MEMORY_MESSAGE_TYPES.includes(message.customType));
-    if (!content && kept.length === event.messages.length) return undefined;
-    return {
-      messages: content ? [{
-        role: "custom",
-        customType: "ssh-remote-project-memory",
-        content,
-        display: false,
-        timestamp: Date.now(),
-      }, ...kept] : kept,
-    };
   });
 }

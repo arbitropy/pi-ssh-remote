@@ -64,6 +64,8 @@ export function renderRemoteControlResult(result: any, expanded: boolean, theme:
   const fallback = result.content?.find((item: any) => item.type === "text")?.text ?? "";
   const details = result.details;
   if (details?.summary) {
+    // Expanded shows the full result text (for example the project instructions the agent was given).
+    if (expanded && fallback.trim() !== String(details.summary).trim()) return new Text(fallback, 0, 0);
     return {
       render: (width: number) => [truncateToWidth(details.summary, width)],
       invalidate() {}, // Stateless: the summary is rendered afresh at each width.

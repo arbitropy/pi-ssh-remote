@@ -97,14 +97,9 @@ export function formatMemoryEntries(memory: MemoryFile | undefined): string {
   return memory.entries.map((entry) => `[${entry.id}]\n${entry.content}`).join("\n\n");
 }
 
-/** Context block injected while a remote project is focused. Returns undefined when there is nothing to apply. */
-export function memoryContext(memoryDir: string, name: string): string | undefined {
+/** The project's memory as the model should see it: path, entries, and the parse error when the file is invalid. */
+export function projectMemorySnapshot(memoryDir: string, name: string): { path: string; entries: MemoryEntry[]; error?: string } {
   const path = projectMemoryPath(memoryDir, name);
-  let memory: MemoryFile | undefined;
-  try { memory = loadProjectMemory(memoryDir, name); }
-  catch (error) {
-    return `<ssh_remote_project_memory project="${name}" path="${path}">\nThe project-memory JSON file is invalid and must not be applied until repaired: ${(error as Error).message}\n</ssh_remote_project_memory>`;
-  }
-  if (!memory?.entries.length) return undefined;
-  return `<ssh_remote_project_memory project="${name}" path="${path}">\nUser-configured persistent memory for this remote project; apply it while working on the project:\n${JSON.stringify(memory.entries, null, 2)}\n</ssh_remote_project_memory>`;
+  try { return { path, entries: loadProjectMemory(memoryDir, name)?.entries ?? [] }; }
+  catch (error) { return { path, entries: [], error: (error as Error).message }; }
 }

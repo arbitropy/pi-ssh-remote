@@ -83,6 +83,16 @@ Switch tools back to this machine, or to another project, with:
 
 `/remote ssh root@host -p 22` is a quick path: it finds or creates a project for that command (named after the alias or `user-host`, with cwd `~`) and connects.
 
+### Project instructions
+
+Pi loads `AGENTS.md` and `CLAUDE.md` only from the local folder tree, so a remote project's own instructions would never reach the model. While the focus is a connected remote project, this extension loads them from the remote and adds them to the system prompt, next to the local ones:
+
+- **Discovery** follows Pi's own rule. For each directory from the project's current directory up to `/`, the first existing regular file among `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, and `CLAUDE.MD` is used (so a directory with both `AGENTS.md` and `CLAUDE.md` contributes `AGENTS.md` only), outermost directory first. Pi's git-worktree shadowing rule is not reproduced.
+- **Limits**: 32 KB per file and 64 KB in total (the nearest directories are kept first). A file cut by a limit ends with `[truncated: N of M bytes; read the file for the rest]`. A UTF-8 byte order mark is removed.
+- **Labels**: remote files appear as `ssh://<project>/<absolute remote path>`, so the model can tell them from local files.
+- **Refresh**: the files are fetched in one round trip when you connect, focus a project, change its directory (`/remote cd`, `chdir`), or after an automatic reconnect. Before an agent run, a copy older than 5 minutes is refreshed first, waiting at most 5 seconds; if the remote does not answer, the previous copy is used.
+- **Visibility**: when the agent runs `remote` with `connect` or `focus` (or a `chdir` that changes the applicable files), the result lists the instructions and the project memory it just received, so they are in the transcript at the moment of the switch. The `/remote connect` and `/remote focus` commands print a one-line summary instead (`Loaded 2 instruction files and 1 memory entry for NAME`). `/remote status` lists the loaded files and the memory entry count.
+
 ### Project memory
 
 Tell Pi what to remember for the focused project:
@@ -97,7 +107,7 @@ List saved entries and their IDs:
 /remote memory [NAME]
 ```
 
-Each project has its own file at `~/.pi/agent/ssh-remote-memories/projects/NAME.json`. Pi applies the memory of the focused remote project only, and edits that file with its normal local tools. Use an ID to update or delete an entry:
+Each project has its own file at `~/.pi/agent/ssh-remote-memories/projects/NAME.json`. While a remote project is focused and connected, its memory entries are part of the system prompt (the `ssh_remote_project_memory` section, together with the short instructions for editing the file), and only that project's memory is applied. Pi edits the file with its normal local tools. Use an ID to update or delete an entry:
 
 ```text
 Update memory deploy-command to use /opt/deploy/v2/run.sh.
@@ -200,12 +210,12 @@ tools on the local repository.
 |---|---|
 | `/remote` / `/remote list` | List saved projects (name, ssh, cwd, state, note) and the current focus, as copyable text |
 | `/remote add NAME SSH CWD [NOTE...]` | Save a project; quote a full ssh command or pass a bare target |
-| `/remote edit NAME key=value...` | Change `ssh`, `cwd`, `note`, `guard`, `local`, or `forwards`; `key=` clears an optional field |
+| `/remote edit NAME key=value...` | Change `ssh`, `cwd`, `note`, `guard`, `local`, or `forwards`; `key=` clears an optional field. A value runs until the next `key=`, so `note=Staging server` needs no quotes |
 | `/remote remove NAME` | Delete a saved project (its memory file is kept) |
 | `/remote connect NAME` | Connect a project (exact name) and focus it |
 | `/remote focus NAME\|local` | Send tools to a session project or back to local; a disconnected session project is reconnected |
 | `/remote disconnect [NAME]` | Disconnect a project (default: the focused one); focus returns to local if it was focused |
-| `/remote status` | Show the focus and the session's projects |
+| `/remote status` | Show the focus, the session's projects, and the focused project's loaded instruction files and memory entry count |
 | `/remote memory [NAME]` | Show a project's memory entries, IDs, and file |
 | `/remote cd PATH` | Change the focused project's working directory for this session |
 | `/remote exec [--timeout S] [--lines N] COMMAND` | Run one command in the focused project |

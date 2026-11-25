@@ -377,17 +377,26 @@ export function parseAddArgs(rest: string): { name: string; fields: Required<Pic
   return { name, fields: { ssh, cwd, ...(note.length ? { note: note.join(" ") } : {}) } };
 }
 
-/** `/remote edit NAME key=value...` (a key with an empty value clears an optional field). */
+/**
+ * `/remote edit NAME key=value...` (a key with an empty value clears an optional field). A value runs until the next
+ * `key=` token, so `note=Staging server` works without quotes; quoted values still work.
+ */
 export function parseEditArgs(rest: string): { name: string; fields: ProjectFields } {
-  const [name, ...pairs] = shellWords(rest);
-  if (!name || !pairs.length) throw new Error(`Usage: /remote edit NAME key=value...  (keys: ${PROJECT_FIELDS.join(", ")}; "key=" clears it)`);
-  const fields: Record<string, string> = {};
-  for (const pair of pairs) {
-    const at = pair.indexOf("=");
-    const key = at < 0 ? pair : pair.slice(0, at);
-    if (at < 0 || !(PROJECT_FIELDS as readonly string[]).includes(key)) throw new Error(`Expected key=value with key one of ${PROJECT_FIELDS.join(", ")}: ${pair}`);
-    fields[key] = pair.slice(at + 1);
+  const [name, ...words] = shellWords(rest);
+  if (!name || !words.length) throw new Error(`Usage: /remote edit NAME key=value...  (keys: ${PROJECT_FIELDS.join(", ")}; "key=" clears it)`);
+  const values: Record<string, string[]> = {};
+  let current: string[] | undefined;
+  for (const word of words) {
+    const at = word.indexOf("=");
+    const key = at < 0 ? "" : word.slice(0, at);
+    if ((PROJECT_FIELDS as readonly string[]).includes(key)) {
+      current = values[key] = [];
+      if (word.slice(at + 1)) current.push(word.slice(at + 1));
+    } else if (current) current.push(word);
+    else throw new Error(`Expected key=value with key one of ${PROJECT_FIELDS.join(", ")}: ${word}`);
   }
+  const fields: Record<string, string> = {};
+  for (const [key, parts] of Object.entries(values)) fields[key] = parts.join(" ");
   return { name, fields };
 }
 

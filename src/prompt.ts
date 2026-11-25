@@ -44,6 +44,16 @@ export function memoryManagementPrompt(path: string, project: string): string {
   return `Persistent memory for remote project ${project} is a local JSON file at ${path}: {"project":"${project}","entries":[{"id":"unique-id","content":"text"}]}. This exact path is always handled by the local read, write, and edit tools, even while other tools run on the remote. Read it before changing it; preserve valid JSON and every unrelated entry; add by appending an object with a unique id; update only the matching id. Delete an entry only when the user explicitly asks to delete, remove, or forget it: read the file, identify the exact id, and ask if the target is ambiguous. A correction or replacement is never permission to delete.`;
 }
 
+/** The single `ssh_remote_project_memory` section: the entries to apply plus how to manage them. */
+export function projectMemorySection(project: string, memory: { path: string; entries: unknown[]; error?: string }): string {
+  const state = memory.error
+    ? `The project-memory JSON file is invalid and must not be applied until repaired: ${memory.error}`
+    : memory.entries.length
+      ? `User-configured persistent memory for this remote project; apply it while working on the project:\n${JSON.stringify(memory.entries, null, 2)}`
+      : "No memory entries are saved for this project.";
+  return `${state}\n\n${memoryManagementPrompt(memory.path, project)}`;
+}
+
 /** Renders prompt sections as tagged blocks for hosts that expose only the rendered system prompt. */
 export function renderPromptSections(sections: Record<string, string>): string[] {
   return Object.entries(sections)

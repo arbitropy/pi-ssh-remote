@@ -115,6 +115,16 @@ gpu-box:/srv/train  ● befaq-prod  ○ staging
 
 `/remote ssh root@host -p 22` 是快捷方式：查找或创建对应的项目（以别名或 `user-host` 命名，目录为 `~`）并连接。
 
+### 项目指令
+
+Pi 只会从本地目录树加载 `AGENTS.md` 和 `CLAUDE.md`，远程项目自己的说明原本无法到达模型。当焦点是已连接的远程项目时，本扩展会从远端读取这些文件，并与本地文件一起加入系统提示：
+
+- **查找规则**与 Pi 本地规则一致：从项目当前目录向上直到 `/`，每个目录取 `AGENTS.override.md`、`AGENTS.md`、`AGENTS.MD`、`CLAUDE.md`、`CLAUDE.MD` 中第一个存在的普通文件（同一目录同时有 `AGENTS.md` 和 `CLAUDE.md` 时只取 `AGENTS.md`），外层目录在前。Pi 的 git worktree 去重规则不做处理。
+- **大小限制**：每个文件 32 KB，总计 64 KB（优先保留离当前目录最近的文件）。被截断的文件末尾会附上 `[truncated: N of M bytes; read the file for the rest]`。UTF-8 BOM 会被去掉。
+- **标签**：远程文件以 `ssh://<项目名>/<远端绝对路径>` 标注，模型可以与本地文件区分。
+- **刷新**：连接、聚焦项目、切换目录（`/remote cd`、`chdir`）以及自动重连成功后，会通过一次往返重新读取。每次 Agent 运行前，超过 5 分钟的副本会被刷新，最多等待 5 秒；远端无响应时继续使用旧副本。
+- **可见性**：Agent 调用 `remote` 的 `connect` 或 `focus`（以及改变适用文件的 `chdir`）时，结果中会列出刚获得的项目指令和项目记忆，切换当下就会出现在对话记录里。`/remote connect` 和 `/remote focus` 命令只显示一行摘要（`Loaded 2 instruction files and 1 memory entry for NAME`）。`/remote status` 会列出已加载的文件和记忆条目数。
+
 ### 项目记忆
 
 直接告诉 Pi 要为当前聚焦的项目记住什么：
@@ -129,7 +139,7 @@ gpu-box:/srv/train  ● befaq-prod  ○ staging
 /remote memory [NAME]
 ```
 
-每个项目的记忆保存在 `~/.pi/agent/ssh-remote-memories/projects/NAME.json`。Pi 只会应用当前聚焦的远程项目的记忆，并用本地工具编辑该文件。通过 ID 修改或删除：
+每个项目的记忆保存在 `~/.pi/agent/ssh-remote-memories/projects/NAME.json`。当远程项目处于焦点且已连接时，它的记忆条目会作为系统提示的一部分（`ssh_remote_project_memory` 段，附带简短的文件编辑说明），并且只应用该项目的记忆。Pi 用本地工具编辑该文件。通过 ID 修改或删除：
 
 ```text
 把记忆 deploy-command 改为使用 /opt/deploy/v2/run.sh。
@@ -219,12 +229,12 @@ gpu-box:/srv/train  ● befaq-prod  ○ staging
 |---|---|
 | `/remote` / `/remote list` | 以可复制的文本列出已保存项目（名称、ssh、目录、状态、备注）和当前焦点 |
 | `/remote add NAME SSH CWD [备注...]` | 保存项目；SSH 可用带引号的完整命令或裸目标 |
-| `/remote edit NAME key=value...` | 修改 `ssh`、`cwd`、`note`、`guard`、`local`、`forwards`；`key=` 清除可选字段 |
+| `/remote edit NAME key=value...` | 修改 `ssh`、`cwd`、`note`、`guard`、`local`、`forwards`；`key=` 清除可选字段。值会持续到下一个 `key=`，所以 `note=Staging server` 不需要引号 |
 | `/remote remove NAME` | 删除已保存项目（保留其记忆文件） |
 | `/remote connect NAME` | 连接项目（精确名称）并聚焦 |
 | `/remote focus NAME\|local` | 把工具切到某个会话项目或回到本地；未连接的会话项目会被重新连接 |
 | `/remote disconnect [NAME]` | 断开项目（默认当前焦点）；若它有焦点则焦点回到 local |
-| `/remote status` | 查看焦点和本会话的项目 |
+| `/remote status` | 查看焦点、本会话的项目，以及当前项目已加载的指令文件和记忆条目数 |
 | `/remote memory [NAME]` | 展示项目的记忆条目、ID 和文件 |
 | `/remote cd PATH` | 修改当前聚焦项目在本会话中的工作目录 |
 | `/remote exec [--timeout S] [--lines N] COMMAND` | 在当前聚焦项目中执行一次命令 |
