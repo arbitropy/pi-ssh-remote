@@ -14,6 +14,7 @@ const SUBCOMMANDS: AutocompleteItem[] = [
   { value: "focus", label: "focus", description: "Switch tools to a session project or local" },
   { value: "disconnect", label: "disconnect", description: "Disconnect a project (default: the focused one)" },
   { value: "status", label: "status", description: "Show focus and session projects" },
+  { value: "copy", label: "copy", description: "Copy a file: copy local:PATH|PROJECT:PATH local:PATH|PROJECT:PATH [--overwrite]" },
   { value: "memory", label: "memory", description: "Show a project's memory file" },
   { value: "cd", label: "cd", description: "Change the focused project's working directory" },
   { value: "exec", label: "exec", description: "Run a command in the focused project" },

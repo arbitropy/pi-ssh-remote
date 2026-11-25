@@ -60,7 +60,13 @@ export class RemoteExecAccumulator {
   private newlineCount = 0;
   private lastByte: number | undefined;
 
-  constructor(private maxLines: number, private maxBytes: number) {}
+  private maxLines: number;
+  private maxBytes: number;
+
+  constructor(maxLines: number, maxBytes: number) {
+    this.maxLines = maxLines;
+    this.maxBytes = maxBytes;
+  }
 
   append(chunk: Buffer): void {
     if (!chunk.length) return;
@@ -301,6 +307,20 @@ export async function withSftp<T>(client: SshClient, operation: (sftp: SFTPWrapp
 export const sftpCall = <T = void>(start: (done: (error?: Error | null, result?: T) => void) => void): Promise<T> =>
   new Promise((resolve, reject) => start((error, result) => error ? reject(error) : resolve(result as T)));
 
+/** A private sibling name for writing `target` before it is renamed into place. */
+export const remoteTempPath = (target: string): string =>
+  posix.join(posix.dirname(target), `.${posix.basename(target)}.pi-tmp-${randomBytes(6).toString("hex")}`);
+
+/** Renames `temp` over `target` with posix-rename; only a server without that extension falls back to `mv`. */
+export async function renameOverRemote(client: SshClient, sftp: SFTPWrapper, temp: string, target: string): Promise<void> {
+  try { await sftpCall((done) => sftp.ext_openssh_rename(temp, target, done)); }
+  catch (error) {
+    // A real rename failure must not fall back.
+    if (!/does not support/i.test((error as Error).message)) throw error;
+    await execRemote(client, `mv -f -- ${quote(temp)} ${quote(target)}`);
+  }
+}
+
 // Writes through a temp sibling and renames it over the target, so an interrupted write never leaves a
 // truncated file. Targets that are not regular files, and directories where a temp file cannot be created, are
 // written in place.
@@ -313,7 +333,7 @@ export async function writeRemoteFileAtomic(client: SshClient, sftp: SFTPWrapper
     mode = attrs.mode & 0o7777;
   } catch { /* new file, or unreadable metadata: the writes below report the real error */ }
 
-  const temp = posix.join(posix.dirname(target), `.${posix.basename(target)}.pi-tmp-${randomBytes(6).toString("hex")}`);
+  const temp = remoteTempPath(target);
   // An existing file's mode is copied after the write; until then the temp stays private to the owner.
   const tempOptions = mode === undefined ? { mode: 0o666 } : { mode: 0o600 };
   try { await sftpCall((done) => sftp.writeFile(temp, content, tempOptions, done)); }
@@ -324,12 +344,7 @@ export async function writeRemoteFileAtomic(client: SshClient, sftp: SFTPWrapper
   }
   try {
     if (mode !== undefined) await sftpCall((done) => sftp.chmod(temp, mode, done));
-    try { await sftpCall((done) => sftp.ext_openssh_rename(temp, target, done)); }
-    catch (error) {
-      // Only a server without posix-rename@openssh.com falls back to mv; a real rename failure must not.
-      if (!/does not support/i.test((error as Error).message)) throw error;
-      await execRemote(client, `mv -f -- ${quote(temp)} ${quote(target)}`);
-    }
+    await renameOverRemote(client, sftp, temp, target);
   } catch (error) {
     await sftpCall((done) => sftp.unlink(temp, done)).catch(() => {});
     throw error;

@@ -18,7 +18,7 @@ export interface Project {
   cwd: string;
   note?: string;
   guard?: Guard;
-  /** Informational local checkout path; displayed only. */
+  /** Local checkout path: shown in listings, and the repository `status` compares this project's git HEAD against. */
   local?: string;
   forwards?: string[];
 }

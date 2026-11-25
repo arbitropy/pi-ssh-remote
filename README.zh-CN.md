@@ -244,7 +244,8 @@ Pi 只会从本地目录树加载 `AGENTS.md` 和 `CLAUDE.md`，远程项目自�
 | `/remote connect NAME` | 连接项目（精确名称）并聚焦（Agent 的 `connect` 还支持 `focus=false`） |
 | `/remote focus NAME\|local` | 把工具切到某个会话项目或回到本地；未连接的会话项目会被重新连接 |
 | `/remote disconnect [NAME]` | 断开项目（默认当前焦点）；若它有焦点则焦点回到 local |
-| `/remote status` | 查看焦点、本会话的项目，以及当前项目已加载的指令文件和记忆条目数 |
+| `/remote status` | 查看焦点、本会话的项目、当前项目已加载的指令文件和记忆条目数，以及本地和每个已连接项目的 [Git 信息块](#工作在哪里git-状态与复制) |
+| `/remote copy FROM TO [--overwrite]` | 在 `local:路径` 和/或已连接的 `项目:路径` 之间复制一个文件（最大 50 MB）；不受 guard 限制（见[复制文件](#工作在哪里git-状态与复制)） |
 | `/remote memory [NAME]` | 展示项目的记忆条目、ID 和文件 |
 | `/remote cd PATH` | 修改当前聚焦项目在本会话中的工作目录 |
 | `/remote exec [--on NAME] [--timeout S] [--lines N] COMMAND` | 在当前聚焦项目（或指定的会话项目 `NAME`）中执行一次命令 |
@@ -258,22 +259,38 @@ Pi 只会从本地目录树加载 `AGENTS.md` 和 `CLAUDE.md`，远程项目自�
 | `/remote config exec-max-lines 200` / `exec-max-bytes 8192` | 设置远端命令输出预算 |
 | `/remote config turn-max-bytes 32768` | 设置每轮远端工具总输出预算 |
 
-项目名称使用小写字母、数字、`.`、`_`、`-`（最长 64 个字符，以字母或数字开头），`local` 为保留名。`guard`（`readonly` 或 `confirm`）和 `local`（本地目录）会被记录并展示给 Agent 和列表；其中 `guard` 会对 Agent 的工具调用强制执行（见 [Guard（防护）](#guard防护)），`local` 仅供参考。
+项目名称使用小写字母、数字、`.`、`_`、`-`（最长 64 个字符，以字母或数字开头），`local` 为保留名。`guard`（`readonly` 或 `confirm`）和 `local`（本地目录）会被记录并展示给 Agent 和列表；其中 `guard` 会对 Agent 的工具调用强制执行（见 [Guard（防护）](#guard防护)），`local` 是 `/remote status` 用来查找对应本地仓库的路径（见下文）。
 
 ### `remote` 工具
 
-Agent 使用一个工具，包含这些 action：`list`、`add`、`edit`、`remove`、`connect`、`disconnect`、`focus`、`status`、`chdir`、`memory`、`forward`、`unforward`、`forget`。`connect` 需要精确的项目名称（名称不存在时会返回几个相近的已保存项目），并支持 `focus=false`：只连接、不改变焦点。命令通过 `bash` 执行（用其 `target` 指定其他项目）；原来的 `exec` action 已移除。`remove` 只用于用户明确提出的请求。密码和密钥 passphrase 绝不会作为参数接收。
+Agent 使用一个工具，包含这些 action：`list`、`add`、`edit`、`remove`、`connect`、`disconnect`、`focus`、`status`、`chdir`、`memory`、`forward`、`unforward`、`forget`、`copy`。`connect` 需要精确的项目名称（名称不存在时会返回几个相近的已保存项目），并支持 `focus=false`：只连接、不改变焦点。命令通过 `bash` 执行（用其 `target` 指定其他项目）；原来的 `exec` action 已移除。`remove` 只用于用户明确提出的请求。密码和密钥 passphrase 绝不会作为参数接收。
+
+### 工作在哪里？Git 状态与复制
+
+`/remote status`（以及 `remote(action="status")`）末尾会有一个 **Git** 信息块，列出 Pi 所在的本地目录，以及每个*已连接*且目录位于 git 仓库内的项目。它是只读的（不会 fetch；`git status` 不会改动索引），每个项目只执行一条很短的命令，并行运行，限时 10 秒：
+
+```text
+Git:
+- local: main 4a5483d "Fix payment timeout"; clean; ahead 1 of origin/main; github.com/acme/api
+- staging: main 9897131 "Raise GATEWAY_TIMEOUT to 20s"; 2 dirty; in sync with origin/main; github.com/acme/api
+- prod: git: unavailable (not a git repository)
+  staging: 1 behind local (main 4a5483d)
+```
+
+每行显示分支（或 `detached`）、HEAD 短哈希和提交标题、未提交条目数、相对 upstream 的领先/落后，以及规范化后的 origin（`git@host:org/repo.git`、`ssh://git@host/org/repo`、`https://host/org/repo` 都显示为 `host/org/repo`；凭据绝不会显示）。origin 相同的条目归为一组；组内有本地仓库时，每个远端条目会多一行对比：`same commit as local`、`N behind local`、`N ahead of local`、`N ahead, M behind local`，或在本地没有该提交时显示 `HEAD abc1234 not in local repo (git fetch?)`。组内没有本地仓库时，远端条目之间只比较 HEAD 是否相同。项目的 `local` 路径（`/remote edit NAME local=~/src/app`）会代替 Pi 所在目录作为该项目的本地对比仓库，显示为 `local:NAME`。不是仓库、没有 `git` 或超时只会让该条目显示一行 `git: unavailable (...)`，不会让整个 status 失败；Pi 所在目录不是仓库时则不显示本地条目。
+
+**复制文件。** `/remote copy FROM TO [--overwrite]` 和工具的 `copy` action（参数 `from`、`to`、`overwrite`）在本机和/或已连接项目之间复制一个普通文件，两端的写法都是 `local:路径` 或 `项目:路径`。相对路径相对于该端的工作目录（项目的会话目录，或 Pi 所在的本地目录），`~` 表示该端的主目录。文件会先流式写入同目录下的临时文件，再重命名到位，因此中断或中止的复制不会留下残缺的目标；远端到远端的复制经由本机中转。目标已存在时会拒绝，除非加 `--overwrite`/`overwrite=true`；目录会被拒绝（请用 `bash` 配合 `tar`）；超过 50 MB 的文件也会被拒绝。Agent 的 `copy` 与 `write` 一样受**目标**项目的 [guard](#guard防护) 约束；源端的 guard 不起作用，本地目标不受限制，你自己输入的 `/remote copy` 与 `!` 一样从不受 guard 限制。
 
 ### Guard（防护）
 
-项目的 `guard`（用 `/remote edit NAME guard=readonly|confirm` 设置，`guard=` 清除）限制 **Agent 的工具调用**在该项目上能做什么。它作用于在该项目上执行的 `write`、`edit`、`bash`（无论是跟随焦点还是使用 `target`）；`read`、`grep`、`find`、`ls` 始终允许。本地调用和没有 guard 的项目不受影响，你自己输入的命令（`!` 和 `/remote exec`）也从不受 guard 限制。
+项目的 `guard`（用 `/remote edit NAME guard=readonly|confirm` 设置，`guard=` 清除）限制 **Agent 的工具调用**在该项目上能做什么。它作用于在该项目上执行的 `write`、`edit`、`bash`（无论是跟随焦点还是使用 `target`），以及 Agent 向该项目发起的 `copy`；`read`、`grep`、`find`、`ls` 始终允许。本地调用和没有 guard 的项目不受影响，你自己输入的命令（`!` 和 `/remote exec`）也从不受 guard 限制。
 
 | Guard | `write` / `edit` | `bash` |
 |---|---|---|
-| `confirm` | 每次调用都询问你 | 每次调用都询问你 |
-| `readonly` | 直接拒绝，不弹窗；Agent 会被告知请你操作或放宽 guard | 仅当命令可证明为只读时才直接运行，否则询问你 |
+| `confirm` | 每次调用都询问你（向该项目 `copy` 也一样） | 每次调用都询问你 |
+| `readonly` | 直接拒绝，不弹窗（向该项目 `copy` 也一样）；Agent 会被告知请你操作或放宽 guard | 仅当命令可证明为只读时才直接运行，否则询问你 |
 
-确认对话框标题为 `<项目> (guard: <guard>)`，内容包含工具名和完整命令、写入的路径与字节数，或编辑的路径与修改摘要。`readonly` 下还会指出命令中第一个未被识别为只读的部分。如果你拒绝、对话框超时（RPC 等非 TUI 宿主为 30 秒），或在对话框打开时中止了 Agent，调用都会报错，远端不会执行任何操作，并且会告诉 Agent 不要重试。会话没有 UI（例如 print 模式）时，需要确认的调用会被直接拒绝并说明原因。并行调用会逐个询问。
+确认对话框标题为 `<项目> (guard: <guard>)`，内容包含工具名和完整命令、写入的路径与字节数、编辑的路径与修改摘要，或复制的源、目标与大小。`readonly` 下还会指出命令中第一个未被识别为只读的部分。如果你拒绝、对话框超时（RPC 等非 TUI 宿主为 30 秒），或在对话框打开时中止了 Agent，调用都会报错，远端不会执行任何操作，并且会告诉 Agent 不要重试。会话没有 UI（例如 print 模式）时，需要确认的调用会被直接拒绝并说明原因。并行调用会逐个询问。
 
 只读分类器是保守的白名单，不是 shell 解释器：拿不准就判为“非只读”，并询问你。只有命令的每个部分（按 `|`、`||`、`&&`、`;`、换行拆分）都是已知的只读程序且不带危险参数时才通过，例如 `cat`、`grep`、`ls`、`find`（不含 `-delete`/`-exec`）、不带 `-i` 且无写入/执行命令的 `sed`、无输出重定向和 `system()` 的 `awk`、`git status|log|diff|show|branch`（仅列出）、`docker ps|logs|inspect`、`docker compose ps|logs`、`kubectl get|describe|logs`、`systemctl status|show|is-active`、`journalctl`、不带请求体、上传、输出文件且方法为 GET/HEAD 的 `curl`，以及 `ps`、`df`、`free`、`ss`、`ip addr` 等。开头的 `sudo -n [-u USER]`、`env`、`nice`、`timeout N`、`time` 会被穿透检查。输出重定向（`/dev/null` 和 `2>&1` 除外）、命令/进程替换、反引号、后台任务、子 shell、`eval`/`exec`/`source`、`xargs`、`tee`、解释器和数据库客户端（`psql`、`mysql`、`redis-cli`）一律不通过。
 

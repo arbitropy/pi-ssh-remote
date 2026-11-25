@@ -8,6 +8,7 @@
 
 import type { Client as SshClient, ClientChannel } from "ssh2";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import { Type } from "typebox";
@@ -71,6 +72,9 @@ import { parseSessionState, SESSION_STATE_ENTRY_TYPE, type SessionState } from "
 import { askSecret, NON_INTERACTIVE_DIALOG_TIMEOUT_MS, previewRemoteOutput, renderRemoteControlCall, renderRemoteControlResult, withProjectPrefix } from "./src/render.ts";
 import { explainUnsafe, guardBlockedMessage, guardConfirmBody, guardDeclinedMessage, guardNoUiMessage, guardVerdict } from "./src/guard.ts";
 import { remoteArgumentCompletions, suppressRemoteCompletionsBeforeSuffix } from "./src/complete.ts";
+import { buildGitScript, compareGit, formatGitBlock, gatherLocalGit, GIT_TIMEOUT_SECONDS, LOCAL_LABEL, newGitDelimiter, parseGitScriptOutput, type GitEntry, type GitResult } from "./src/gitstatus.ts";
+import { parseCopyArgs, parseCopyEndpoint } from "./src/copy.ts";
+import { copyFile, localSide, remoteSide, resolveSidePath, type FileSide } from "./src/transfer.ts";
 
 /** A project used in this session. `key`/`parsed` identify its pooled connection while connected. */
 interface SessionProject {
@@ -117,7 +121,7 @@ const MEMORY_DIR = join(AGENT_DIR, "ssh-remote-memories");
 const CACHE_KEY = "__piHpcCredentialCacheV1";
 const ROUTING = "Runs on the focus unless target is set.";
 const TARGET_DESCRIPTION = 'Where to run: "local" or a remote project connected in this session (default: the current focus).';
-const REMOTE_ACTIONS = ["list", "add", "edit", "remove", "connect", "disconnect", "focus", "status", "chdir", "memory", "forward", "unforward", "forget"] as const;
+const REMOTE_ACTIONS = ["list", "add", "edit", "remove", "connect", "disconnect", "focus", "status", "chdir", "memory", "forward", "unforward", "forget", "copy"] as const;
 const EVENT_MESSAGE_TYPE = "ssh-remote-event";
 const EVENT_COALESCE_MS = 40;
 const IS_WINDOWS = process.platform === "win32";
@@ -814,7 +818,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const command = typeof params?.command === "string" ? params.command : undefined;
     const verdict = guardVerdict(guard, tool, command);
     if (verdict === "allow") return;
-    if (verdict === "block") throw new Error(guardBlockedMessage(rt.name));
+    if (verdict === "block") throw new Error(guardBlockedMessage(rt.name, tool));
     if (signal?.aborted) throw abortedError();
     const unsafe = guard === "readonly" && tool === "bash" ? explainUnsafe(command ?? "") : undefined;
     if (!ctx?.hasUI) throw new Error(guardNoUiMessage(rt.name, guard!, tool, unsafe));
@@ -1000,6 +1004,109 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   };
 
+  // ---- git status: where is the work? ------------------------------------------------------------------
+  // One exec per connected project plus execFile for the local repositories, all in parallel and read-only.
+  // A failure is one `git: unavailable (...)` line for that entry; it never fails the status.
+
+  const gitFailureReason = (error: unknown): string => {
+    const message = firstLine((error as Error)?.message ?? String(error));
+    return /timed out/i.test(message) ? `timed out after ${GIT_TIMEOUT_SECONDS} s` : message;
+  };
+
+  const remoteGit = async (rt: SessionProject, signal?: AbortSignal): Promise<GitResult> => {
+    const delimiter = newGitDelimiter();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // execRemote has no timer until the channel opens; the deadline also covers a remote that never answers.
+      const output = await Promise.race([
+        withReconnect(rt, (client) => execRemote(client, buildGitScript(rt.cwd, delimiter), true, GIT_TIMEOUT_SECONDS), signal),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${GIT_TIMEOUT_SECONDS} s`)), (GIT_TIMEOUT_SECONDS + 2) * 1000); }),
+      ]);
+      return parseGitScriptOutput(output.toString("utf8"), delimiter);
+    } catch (error) {
+      if (signal?.aborted) throw abortedError();
+      return { ok: false, reason: gitFailureReason(error) };
+    } finally { clearTimeout(timer); }
+  };
+
+  /** The project's `local` link as an absolute path (`~` and relative paths allowed), if one is set. */
+  const linkedLocalPath = (link: string | undefined): string | undefined => {
+    const value = link?.trim();
+    if (!value) return undefined;
+    return resolve(localCwd, value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(1)) : value);
+  };
+
+  const gitStatusLines = async (signal?: AbortSignal): Promise<string[]> => {
+    try {
+      const projects = catalog().projects;
+      const connected = session.filter((p) => p.connected);
+      const sessionRepo = resolve(localCwd);
+      const linkLabels = new Map<string, string>(); // linked local path -> entry label
+      const linkOf = new Map<string, string>();     // project -> entry label
+      for (const rt of connected) {
+        const path = linkedLocalPath(projects[rt.name]?.local);
+        if (!path || path === sessionRepo) continue;
+        if (!linkLabels.has(path)) linkLabels.set(path, `${LOCAL_LABEL}:${rt.name}`);
+        linkOf.set(rt.name, linkLabels.get(path)!);
+      }
+      const [local, linked, remote] = await Promise.all([
+        gatherLocalGit(localCwd),
+        Promise.all([...linkLabels.keys()].map((path) => gatherLocalGit(path))),
+        Promise.all(connected.map((rt) => remoteGit(rt, signal))),
+      ]);
+      if (signal?.aborted) throw abortedError();
+      const entries: GitEntry[] = [];
+      // Pi's own folder not being a repository is the common case and not worth a line; other failures are.
+      if (local.ok || local.reason !== "not a git repository") entries.push({ label: LOCAL_LABEL, result: local, repo: localCwd });
+      [...linkLabels].forEach(([path, label], index) => entries.push({ label, result: linked[index]!, repo: path }));
+      connected.forEach((rt, index) => entries.push({ label: rt.name, result: remote[index]!, ...(linkOf.has(rt.name) ? { link: linkOf.get(rt.name)! } : {}) }));
+      return formatGitBlock(entries, await compareGit(entries));
+    } catch (error) {
+      if (signal?.aborted) throw abortedError();
+      return [`Git: unavailable (${gitFailureReason(error)})`];
+    }
+  };
+
+  const statusReport = async (signal?: AbortSignal): Promise<string> => [statusText(), ...await gitStatusLines(signal)].join("\n");
+
+  // ---- copy between projects ---------------------------------------------------------------------------
+
+  /**
+   * Copies one regular file between `local` and/or connected projects (see src/transfer.ts). `guarded` applies the
+   * destination project's guard as for `write`; the user's own /remote copy is not guarded.
+   */
+  const runCopy = async (fromSpec: unknown, toSpec: unknown, overwrite: boolean, options: { signal?: AbortSignal; ctx?: any; guarded: boolean }): Promise<string> => {
+    const { signal } = options;
+    const from = parseCopyEndpoint(fromSpec, "from");
+    const to = parseCopyEndpoint(toSpec, "to");
+    const fromRt = resolveTarget(from.project);
+    const toRt = resolveTarget(to.project);
+    // A readonly destination is refused before anything is opened; a confirm guard asks once the copy is known to be valid.
+    if (options.guarded && toRt && guardVerdict(catalog().projects[toRt.name]?.guard, "copy") === "block") throw new Error(guardBlockedMessage(toRt.name, "copy"));
+    const fromLabel = `${from.project}:${from.path}`;
+    const toLabel = `${to.project}:${to.path}`;
+    const withSide = async <T>(rt: SessionProject | undefined, use: (side: FileSide, cwd: string) => Promise<T>): Promise<T> => {
+      if (!rt) return use(localSide(), localCwd);
+      const client = await withReconnect(rt, async (live) => live, signal);
+      return withSftp(client, (sftp) => use(remoteSide(rt.name, client, sftp), rt.cwd));
+    };
+    const bytes = await withSide(fromRt, (fromSide, fromCwd) => withSide(toRt, async (toSide, toCwd) => {
+      const fromPath = await resolveSidePath(fromSide, fromCwd, from.path);
+      const toPath = await resolveSidePath(toSide, toCwd, to.path);
+      return copyFile(
+        { side: fromSide, path: fromPath, label: fromLabel },
+        { side: toSide, path: toPath, label: toLabel },
+        {
+          overwrite, signal, formatSize,
+          beforeWrite: async (size) => {
+            if (options.guarded && toRt) await enforceGuard("copy", toRt, { from: fromLabel, to: toLabel, overwrite, size: formatSize(size) }, signal, options.ctx);
+          },
+        },
+      );
+    }));
+    return `Copied ${formatSize(bytes)} from ${fromLabel} to ${toLabel}.`;
+  };
+
   const contextDetails = (rt: SessionProject) => ({ instructions: cachedInstructions(rt).map((file) => instructionLabel(rt.name, file.path)) });
 
   // Every result built here ends with exactly one `Focus:` line; `extra` (project context) goes before it.
@@ -1059,7 +1166,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "remote",
     label: "Remote",
-    description: "Manage saved remote SSH projects and the focus, where read, write, edit, bash, grep, find, and ls run by default. connect focuses the project unless focus=false; focus local returns to this machine.",
+    description: "Manage saved remote SSH projects and the focus, where read, write, edit, bash, grep, find, and ls run by default. connect focuses the project unless focus=false; focus local returns to this machine. status compares git state (branch, HEAD, ahead/behind vs local) across connected projects. copy sends one file (max 50 MB) between local and connected projects.",
     promptSnippet: "Manage remote SSH projects and the tool focus",
     promptGuidelines: [
       "Find saved projects with remote list and connect by exact name; switch with focus. Use chdir to change a project's directory.",
@@ -1073,9 +1180,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       cwd: Type.Optional(Type.String({ description: "Remote directory (~ ok), for add, edit, and chdir" })),
       note: Type.Optional(Type.String({ description: "One-line note; empty clears" })),
       guard: Type.Optional(Type.String({ description: "readonly (write/edit blocked, non-read-only bash asks the user) or confirm (write/edit/bash ask the user); empty clears" })),
-      local: Type.Optional(Type.String({ description: "Local checkout path (informational); empty clears" })),
+      local: Type.Optional(Type.String({ description: "Local checkout path (status compares git HEADs against it); empty clears" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT" })),
       focus: Type.Optional(Type.Boolean({ description: "connect only: false keeps the current focus" })),
+      from: Type.Optional(Type.String({ description: "copy source: local:<path> or <project>:<path>" })),
+      to: Type.Optional(Type.String({ description: "copy destination, same form (a file path)" })),
+      overwrite: Type.Optional(Type.Boolean({ description: "copy: replace an existing destination" })),
     }),
     async execute(_id, params, signal, _update, ctx) {
       currentCtx = ctx;
@@ -1084,7 +1194,11 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         case "list":
           return { content: [{ type: "text", text: formatProjectList(view(projects.projects)) }], details: { focus, projects: Object.keys(projects.projects) } };
         case "status":
-          return { content: [{ type: "text", text: statusText() }], details: { focus, projects: session.map(({ name, cwd, connected }) => ({ name, cwd, connected })) } };
+          return { content: [{ type: "text", text: await statusReport(signal) }], details: { focus, projects: session.map(({ name, cwd, connected }) => ({ name, cwd, connected })) } };
+        case "copy": {
+          const text = await runCopy(params.from, params.to, params.overwrite === true, { signal, ctx, guarded: true });
+          return { content: [{ type: "text", text }], details: { summary: text, from: params.from, to: params.to } };
+        }
         case "add": {
           const name = validateProjectName(params.name);
           if (projects.projects[name]) throw new Error(`Project "${name}" already exists; use action "edit" to change it`);
@@ -1182,10 +1296,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return { value: name, label: name, description: `${state}: ${project.ssh}, ${project.cwd}` };
     });
 
-  const REMOTE_USAGE = "Usage: /remote [list] | add NAME SSH CWD [NOTE...] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | memory [NAME] | cd PATH | exec [--on NAME] [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config [KEY N]";
+  const REMOTE_USAGE = "Usage: /remote [list] | add NAME SSH CWD [NOTE...] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | copy FROM TO [--overwrite] | memory [NAME] | cd PATH | exec [--on NAME] [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config [KEY N]";
 
   pi.registerCommand("remote", {
-    description: "Manage remote SSH projects: /remote [list] | add NAME SSH CWD [NOTE] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | memory [NAME] | cd PATH | exec [--on NAME] [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config",
+    description: "Manage remote SSH projects: /remote [list] | add NAME SSH CWD [NOTE] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | copy FROM TO [--overwrite] | memory [NAME] | cd PATH | exec [--on NAME] [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => remoteArgumentCompletions(prefix, projectCompletionItems),
     handler: async (args, ctx) => {
       currentCtx = ctx;
@@ -1200,7 +1314,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           case "list":
             return info(formatProjectList(view()));
           case "status":
-            return info(statusText());
+            return info(await statusReport());
+          case "copy": {
+            const { from, to, overwrite } = parseCopyArgs(shellWords(rest));
+            const message = await runCopy(from, to, overwrite, { guarded: false });
+            announce(`User copied ${from} to ${to}`);
+            return info(message);
+          }
           case "add": {
             const { name, fields } = parseAddArgs(rest);
             validateProjectName(name);

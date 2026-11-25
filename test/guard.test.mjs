@@ -1,7 +1,7 @@
 // Table test for the read-only classifier. Run: node --test test/guard.test.mjs  (Node 22.18+/24 strips types)
 import test from "node:test";
 import assert from "node:assert/strict";
-import { explainUnsafe, guardVerdict, isReadOnlyCommand } from "../src/guard.ts";
+import { explainUnsafe, guardBlockedMessage, guardConfirmBody, guardVerdict, isReadOnlyCommand } from "../src/guard.ts";
 
 const SAFE = [], UNSAFE = [];
 const safe = (...c) => SAFE.push(...c), unsafe = (...c) => UNSAFE.push(...c);
@@ -48,4 +48,13 @@ test("guard verdicts", () => {
   assert.equal(guardVerdict("readonly", "bash", "ls"), "allow");
   assert.equal(guardVerdict("readonly", "bash", "rm x"), "confirm");
   assert.equal(guardVerdict("readonly", "bash"), "confirm");
+});
+test("copy is judged like a write into the destination", () => {
+  assert.equal(guardVerdict(undefined, "copy"), "allow");
+  assert.equal(guardVerdict("readonly", "copy"), "block");
+  assert.equal(guardVerdict("confirm", "copy"), "confirm");
+  assert.match(guardBlockedMessage("prod", "copy"), /forbids write\/edit \(including copying files into it\)\. Ask/);
+  assert.match(guardBlockedMessage("prod"), /forbids write\/edit\. Ask/);
+  assert.equal(guardConfirmBody("copy", { from: "prod:a.log", to: "staging:/tmp/a.log", size: "1.2KB", overwrite: true }), "copy: prod:a.log -> staging:/tmp/a.log (1.2KB, overwrites)");
+  assert.equal(guardConfirmBody("copy", { from: "local:a", to: "staging:b" }), "copy: local:a -> staging:b");
 });

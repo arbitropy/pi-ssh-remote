@@ -724,22 +724,23 @@ export function explainUnsafe(command: string): string {
 
 // ---- guard decisions -----------------------------------------------------------------------------------
 
-export type GuardTool = "read" | "write" | "edit" | "bash" | "grep" | "find" | "ls";
+export type GuardTool = "read" | "write" | "edit" | "bash" | "copy" | "grep" | "find" | "ls";
 export type GuardVerdict = "allow" | "block" | "confirm";
 
 /**
  * What a guard does with a call. Read-style tools are always allowed. `confirm` asks for write, edit and bash;
- * `readonly` blocks write and edit and asks for bash unless the command is provably read-only.
+ * `readonly` blocks write and edit and asks for bash unless the command is provably read-only. `copy` is a write
+ * into the destination project and is judged like `write`.
  */
 export function guardVerdict(guard: Guard | undefined, tool: string, command?: string): GuardVerdict {
-  if (!guard || (tool !== "write" && tool !== "edit" && tool !== "bash")) return "allow";
+  if (!guard || (tool !== "write" && tool !== "edit" && tool !== "bash" && tool !== "copy")) return "allow";
   if (guard === "confirm") return "confirm";
   if (tool === "bash") return typeof command === "string" && isReadOnlyCommand(command) ? "allow" : "confirm";
   return "block";
 }
 
-export const guardBlockedMessage = (project: string): string =>
-  `Blocked: ${project} has guard readonly, which forbids write/edit. Ask the user to make this change or to relax the guard (/remote edit ${project} guard=).`;
+export const guardBlockedMessage = (project: string, tool?: string): string =>
+  `Blocked: ${project} has guard readonly, which forbids write/edit${tool === "copy" ? " (including copying files into it)" : ""}. Ask the user to make this change or to relax the guard (/remote edit ${project} guard=).`;
 
 export const guardDeclinedMessage = (project: string, guard: Guard, tool: string): string =>
   `The user declined this ${tool === "bash" ? "command" : tool} on ${project} (guard: ${guard}). Do not retry; ask the user how to proceed.`;
@@ -765,6 +766,7 @@ export function summarizeEdits(params: any): string {
 /** Dialog text for a call that needs confirmation. */
 export function guardConfirmBody(tool: string, params: any, unsafePart?: string): string {
   const path = typeof params?.path === "string" ? params.path : "(no path)";
+  if (tool === "copy") return `copy: ${String(params?.from ?? "?")} -> ${String(params?.to ?? "?")}${params?.size ? ` (${params.size}${params.overwrite ? ", overwrites" : ""})` : params?.overwrite ? " (overwrites)" : ""}`;
   if (tool === "bash") return `bash:\n${String(params?.command ?? "")}${unsafePart ? `\n\n${unsafePart}` : ""}`;
   if (tool === "write") return `write: ${path} (${Buffer.byteLength(typeof params?.content === "string" ? params.content : "", "utf8")} bytes)`;
   return `edit: ${path}\n${summarizeEdits(params)}`;

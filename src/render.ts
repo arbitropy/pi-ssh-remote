@@ -47,6 +47,7 @@ export function renderRemoteControlCall(params: any, theme: any): Component {
   const action = typeof args.action === "string" && args.action ? args.action : "...";
   let operand: string | undefined;
   if (action === "chdir") operand = stringArg(args.cwd) || "...";
+  else if (action === "copy") operand = stringArg(args.from) || stringArg(args.to) ? `${stringArg(args.from) ?? "..."} -> ${stringArg(args.to) ?? "..."}` : undefined;
   else if (action === "forward") operand = [stringArg(args.name), stringArg(args.forwards)].filter(Boolean).join(" ") || undefined;
   else operand = stringArg(args.name) || undefined;
 
