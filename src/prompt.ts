@@ -4,6 +4,7 @@
  */
 
 import { LOCAL_FOCUS, type Project } from "./catalog.ts";
+import { guardMeaning } from "./guard.ts";
 
 export interface SessionView { name: string; cwd: string; connected: boolean }
 
@@ -32,7 +33,7 @@ export function remotePrompt(view: RemoteView): string {
   for (const p of view.session) {
     const project = view.projects[p.name];
     lines.push(p.connected
-      ? `- ${p.name}: ${sshOf(view, p.name)}, ${p.cwd}. Connected.${project?.guard ? ` Guard: ${project.guard}.` : ""}${project?.note ? ` Note: ${project.note}` : ""}`
+      ? `- ${p.name}: ${sshOf(view, p.name)}, ${p.cwd}. Connected.${project?.guard ? ` Guard: ${project.guard} (${guardMeaning(project.guard)}).` : ""}${project?.note ? ` Note: ${project.note}` : ""}`
       : `- ${p.name}: ${sshOf(view, p.name)}, ${p.cwd}. Disconnected; reconnect with remote(action="connect", name="${p.name}").`);
   }
   if (view.session.some((p) => p.connected)) {

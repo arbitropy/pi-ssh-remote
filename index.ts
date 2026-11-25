@@ -69,6 +69,7 @@ import { createKnownHosts, createPool, resolveCwd, type ConnectUi, type PoolConn
 import { focusLabel, formatProjectList, projectMemorySection, remotePrompt, renderPromptSections, type RemoteView } from "./src/prompt.ts";
 import { parseSessionState, SESSION_STATE_ENTRY_TYPE, type SessionState } from "./src/session.ts";
 import { askSecret, NON_INTERACTIVE_DIALOG_TIMEOUT_MS, previewRemoteOutput, renderRemoteControlCall, renderRemoteControlResult, withProjectPrefix } from "./src/render.ts";
+import { explainUnsafe, guardBlockedMessage, guardConfirmBody, guardDeclinedMessage, guardNoUiMessage, guardVerdict } from "./src/guard.ts";
 import { remoteArgumentCompletions, suppressRemoteCompletionsBeforeSuffix } from "./src/complete.ts";
 
 /** A project used in this session. `key`/`parsed` identify its pooled connection while connected. */
@@ -802,6 +803,33 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return limitResult({ content: [{ type: "text", text }], details }, "search");
   };
 
+  // ---- guards ------------------------------------------------------------------------------------------
+  // Best-effort safety net against agent mistakes, not a security boundary (see src/guard.ts). Applies only to
+  // model tool calls that resolve to a remote project with a guard; the user's own `!` and /remote exec never pass here.
+
+  let guardQueue: Promise<unknown> = Promise.resolve(); // one dialog at a time when the model issues parallel calls
+
+  const enforceGuard = async (tool: string, rt: SessionProject, params: any, signal: AbortSignal | undefined, ctx: any): Promise<void> => {
+    const guard = catalog().projects[rt.name]?.guard;
+    const command = typeof params?.command === "string" ? params.command : undefined;
+    const verdict = guardVerdict(guard, tool, command);
+    if (verdict === "allow") return;
+    if (verdict === "block") throw new Error(guardBlockedMessage(rt.name));
+    if (signal?.aborted) throw abortedError();
+    const unsafe = guard === "readonly" && tool === "bash" ? explainUnsafe(command ?? "") : undefined;
+    if (!ctx?.hasUI) throw new Error(guardNoUiMessage(rt.name, guard!, tool, unsafe));
+    const ask = async (): Promise<boolean> => {
+      if (signal?.aborted) throw abortedError();
+      const options = { ...(signal ? { signal } : {}), ...(ctx.mode !== "tui" ? { timeout: NON_INTERACTIVE_DIALOG_TIMEOUT_MS } : {}) };
+      const approved = await untilAborted(Promise.resolve(ctx.ui.confirm(`${rt.name} (guard: ${guard})`, guardConfirmBody(tool, params, unsafe), options)), signal);
+      if (signal?.aborted) throw abortedError();
+      return approved === true;
+    };
+    const turn = guardQueue.then(ask, ask);
+    guardQueue = turn.then(() => undefined, () => undefined);
+    if (!(await untilAborted(turn, signal))) throw new Error(guardDeclinedMessage(rt.name, guard!, tool));
+  };
+
   // ---- tool routing ------------------------------------------------------------------------------------
 
   // A project's memory file is always read and edited locally, whichever project a call is routed to.
@@ -883,6 +911,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const { target, ...rest } = params ?? {};
         const rt = resolveTarget(target, rest.path);
         recordRoute(id, rt);
+        if (rt) await enforceGuard(builtIn.name, rt, rest, signal, ctx);
         return rt ? remote(rt, id, rest, signal, update, ctx) : local().execute(id, rest, signal, update, ctx);
       },
     } as any);
@@ -1043,7 +1072,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       ssh: Type.Optional(Type.String({ description: "ssh command or target, e.g. me@host or an ~/.ssh/config alias" })),
       cwd: Type.Optional(Type.String({ description: "Remote directory (~ ok), for add, edit, and chdir" })),
       note: Type.Optional(Type.String({ description: "One-line note; empty clears" })),
-      guard: Type.Optional(Type.String({ description: "readonly or confirm (not yet enforced); empty clears" })),
+      guard: Type.Optional(Type.String({ description: "readonly (write/edit blocked, non-read-only bash asks the user) or confirm (write/edit/bash ask the user); empty clears" })),
       local: Type.Optional(Type.String({ description: "Local checkout path (informational); empty clears" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT" })),
       focus: Type.Optional(Type.Boolean({ description: "connect only: false keeps the current focus" })),

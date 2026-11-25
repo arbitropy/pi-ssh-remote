@@ -239,11 +239,26 @@ tools on the local repository.
 | `/remote config exec-max-lines 200` / `exec-max-bytes 8192` | Set the remote command budgets |
 | `/remote config turn-max-bytes 32768` | Set the aggregate per-turn remote output budget |
 
-Project names use lowercase letters, digits, `.`, `_`, and `-` (up to 64 characters, starting with a letter or digit); `local` is reserved. `guard` (`readonly` or `confirm`) and `local` (a local checkout path) are recorded and shown to the agent and in listings; enforcing guards is planned for a later release.
+Project names use lowercase letters, digits, `.`, `_`, and `-` (up to 64 characters, starting with a letter or digit); `local` is reserved. `guard` (`readonly` or `confirm`) and `local` (a local checkout path) are recorded and shown to the agent and in listings; `guard` is enforced for the agent's tool calls (see [Guards](#guards)); `local` is informational.
 
 ### The `remote` tool
 
 The agent uses one tool with these actions: `list`, `add`, `edit`, `remove`, `connect`, `disconnect`, `focus`, `status`, `chdir`, `memory`, `forward`, `unforward`, and `forget`. `connect` needs the exact project name (an unknown name returns a short list of similar saved projects) and takes `focus=false` to connect without changing the focus. Commands run through `bash` (use its `target` for another project); the former `exec` action is gone. `remove` is only for explicit user requests. Passwords and key passphrases are never accepted as arguments.
+
+### Guards
+
+A project's `guard` (set with `/remote edit NAME guard=readonly|confirm`; `guard=` clears it) limits what the **agent's** tool calls may do on that project. It applies to `write`, `edit`, and `bash` calls that run on the project, whether they follow the focus or use `target`; `read`, `grep`, `find`, and `ls` are always allowed. Local calls and projects without a guard are unchanged, and the commands you type yourself (`!` and `/remote exec`) are never guarded.
+
+| Guard | `write` / `edit` | `bash` |
+|---|---|---|
+| `confirm` | ask you for every call | ask you for every call |
+| `readonly` | blocked, with no prompt; the agent is told to ask you or to relax the guard | runs without asking only when the command is provably read-only; otherwise it asks you |
+
+The confirmation dialog is titled `<project> (guard: <guard>)` and shows the tool with the exact command, the path and size of a write, or the path and a short summary of an edit. For `readonly`, it also names the first part of the command that was not recognized as read-only. If you decline, the dialog times out (30 seconds on RPC and other non-TUI hosts), or the agent is aborted while the dialog is open, the call fails with an error and nothing runs on the remote; the agent is told not to retry. When the session has no UI (for example print mode), calls that need confirmation are denied with an error saying so. Parallel calls are asked one at a time.
+
+The read-only classifier is a conservative allowlist, not a shell interpreter: when in doubt it answers "not read-only" and you are asked. A command is accepted only if every part of it (split on `|`, `||`, `&&`, `;`, and newlines) is a known read-only program with no dangerous flags, for example `cat`, `grep`, `ls`, `find` (without `-delete`/`-exec`), `sed` without `-i` or write/execute commands, `awk` without output redirection or `system()`, `git status|log|diff|show|branch` (listing only), `docker ps|logs|inspect`, `docker compose ps|logs`, `kubectl get|describe|logs`, `systemctl status|show|is-active`, `journalctl`, `curl` without a body, upload, output file, or a method other than GET/HEAD, and `ps`, `df`, `free`, `ss`, `ip addr`. A leading `sudo -n [-u USER]`, `env`, `nice`, `timeout N`, or `time` is looked through. Output redirection (other than to `/dev/null` or `2>&1`), command or process substitution, backticks, background jobs, subshells, `eval`/`exec`/`source`, `xargs`, `tee`, interpreters, and database clients (`psql`, `mysql`, `redis-cli`) are never accepted.
+
+Guards are a best-effort safety net against agent mistakes, **not a security boundary**: a command can be dangerous in ways no classifier sees (a script that writes files, an alias on the remote, a flag the list does not know). For real protection use a remote account whose permissions enforce it, for example a read-only SSH user for production.
 
 ### Slash-command completion
 

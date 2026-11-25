@@ -258,11 +258,26 @@ Pi 只会从本地目录树加载 `AGENTS.md` 和 `CLAUDE.md`，远程项目自�
 | `/remote config exec-max-lines 200` / `exec-max-bytes 8192` | 设置远端命令输出预算 |
 | `/remote config turn-max-bytes 32768` | 设置每轮远端工具总输出预算 |
 
-项目名称使用小写字母、数字、`.`、`_`、`-`（最长 64 个字符，以字母或数字开头），`local` 为保留名。`guard`（`readonly` 或 `confirm`）和 `local`（本地目录）只会被记录并展示给 Agent 和列表，强制执行 guard 将在后续版本提供。
+项目名称使用小写字母、数字、`.`、`_`、`-`（最长 64 个字符，以字母或数字开头），`local` 为保留名。`guard`（`readonly` 或 `confirm`）和 `local`（本地目录）会被记录并展示给 Agent 和列表；其中 `guard` 会对 Agent 的工具调用强制执行（见 [Guard（防护）](#guard防护)），`local` 仅供参考。
 
 ### `remote` 工具
 
 Agent 使用一个工具，包含这些 action：`list`、`add`、`edit`、`remove`、`connect`、`disconnect`、`focus`、`status`、`chdir`、`memory`、`forward`、`unforward`、`forget`。`connect` 需要精确的项目名称（名称不存在时会返回几个相近的已保存项目），并支持 `focus=false`：只连接、不改变焦点。命令通过 `bash` 执行（用其 `target` 指定其他项目）；原来的 `exec` action 已移除。`remove` 只用于用户明确提出的请求。密码和密钥 passphrase 绝不会作为参数接收。
+
+### Guard（防护）
+
+项目的 `guard`（用 `/remote edit NAME guard=readonly|confirm` 设置，`guard=` 清除）限制 **Agent 的工具调用**在该项目上能做什么。它作用于在该项目上执行的 `write`、`edit`、`bash`（无论是跟随焦点还是使用 `target`）；`read`、`grep`、`find`、`ls` 始终允许。本地调用和没有 guard 的项目不受影响，你自己输入的命令（`!` 和 `/remote exec`）也从不受 guard 限制。
+
+| Guard | `write` / `edit` | `bash` |
+|---|---|---|
+| `confirm` | 每次调用都询问你 | 每次调用都询问你 |
+| `readonly` | 直接拒绝，不弹窗；Agent 会被告知请你操作或放宽 guard | 仅当命令可证明为只读时才直接运行，否则询问你 |
+
+确认对话框标题为 `<项目> (guard: <guard>)`，内容包含工具名和完整命令、写入的路径与字节数，或编辑的路径与修改摘要。`readonly` 下还会指出命令中第一个未被识别为只读的部分。如果你拒绝、对话框超时（RPC 等非 TUI 宿主为 30 秒），或在对话框打开时中止了 Agent，调用都会报错，远端不会执行任何操作，并且会告诉 Agent 不要重试。会话没有 UI（例如 print 模式）时，需要确认的调用会被直接拒绝并说明原因。并行调用会逐个询问。
+
+只读分类器是保守的白名单，不是 shell 解释器：拿不准就判为“非只读”，并询问你。只有命令的每个部分（按 `|`、`||`、`&&`、`;`、换行拆分）都是已知的只读程序且不带危险参数时才通过，例如 `cat`、`grep`、`ls`、`find`（不含 `-delete`/`-exec`）、不带 `-i` 且无写入/执行命令的 `sed`、无输出重定向和 `system()` 的 `awk`、`git status|log|diff|show|branch`（仅列出）、`docker ps|logs|inspect`、`docker compose ps|logs`、`kubectl get|describe|logs`、`systemctl status|show|is-active`、`journalctl`、不带请求体、上传、输出文件且方法为 GET/HEAD 的 `curl`，以及 `ps`、`df`、`free`、`ss`、`ip addr` 等。开头的 `sudo -n [-u USER]`、`env`、`nice`、`timeout N`、`time` 会被穿透检查。输出重定向（`/dev/null` 和 `2>&1` 除外）、命令/进程替换、反引号、后台任务、子 shell、`eval`/`exec`/`source`、`xargs`、`tee`、解释器和数据库客户端（`psql`、`mysql`、`redis-cli`）一律不通过。
+
+Guard 是针对 Agent 误操作的尽力而为的安全网，**不是安全边界**：命令可能以分类器看不到的方式造成破坏（写文件的脚本、远端的别名、列表中没有的参数）。需要真正的保护时，请使用权限本身受限的远程账号，例如给生产环境使用只读的 SSH 用户。
 
 ### 斜杠命令补全
 
