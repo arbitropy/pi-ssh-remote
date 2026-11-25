@@ -2,9 +2,8 @@
  * Pi UI pieces: the masked secret input and the `remote` tool's call/result renderers.
  */
 
-import { DEFAULT_MAX_BYTES, keyHint, truncateTail } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
-import { DEFAULT_DISPLAY_LINES } from "./catalog.ts";
+import { DEFAULT_MAX_BYTES, truncateTail } from "@earendil-works/pi-coding-agent";
+import { CURSOR_MARKER, Key, Text, matchesKey, truncateToWidth, visibleWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
 
 // Bounds interactive dialogs (secret prompts, host-key trust, command input) on non-interactive hosts such
 // as RPC: the host may never answer, and an unbounded wait would otherwise wedge the process.
@@ -47,10 +46,7 @@ export function renderRemoteControlCall(params: any, theme: any): Component {
   const args = params ?? {};
   const action = typeof args.action === "string" && args.action ? args.action : "...";
   let operand: string | undefined;
-  if (action === "exec") {
-    const name = stringArg(args.name);
-    operand = `${name ? `${name} ` : ""}$ ${stringArg(args.remoteCommand) || "..."}`;
-  } else if (action === "chdir") operand = stringArg(args.cwd) || "...";
+  if (action === "chdir") operand = stringArg(args.cwd) || "...";
   else if (action === "forward") operand = [stringArg(args.name), stringArg(args.forwards)].filter(Boolean).join(" ") || undefined;
   else operand = stringArg(args.name) || undefined;
 
@@ -71,31 +67,37 @@ export function renderRemoteControlResult(result: any, expanded: boolean, theme:
       invalidate() {}, // Stateless: the summary is rendered afresh at each width.
     };
   }
-  if (details?.action !== "exec") return new Text(fallback, 0, 0);
+  return new Text(fallback, 0, 0);
+}
 
-  const output = details.output || fallback;
-  const displayLines = details.displayLines || DEFAULT_DISPLAY_LINES;
-  const warnings = [
-    ...(details.fullOutputPath ? [`Full output: ${details.fullOutputPath}`] : []),
-    ...(details.truncation?.truncated ? [`Truncated: showing ${details.truncation.outputLines} of ${details.truncation.totalLines} lines`] : []),
-  ];
-  const warning = warnings.length ? warnings.join(". ") : undefined;
-
-  if (expanded) {
-    return new Text(`${output}${warning ? `\n${theme.fg("warning", `[${warning}]`)}` : ""}`, 0, 0);
+/** A built-in call header with a project prefix on its first line; `inner` is the built-in component. */
+class PrefixedCall implements Component {
+  constructor(public inner: Component, public prefix: string) {}
+  render(width: number): string[] {
+    const lines = this.inner.render(Math.max(1, width - visibleWidth(this.prefix)));
+    return lines.length ? [this.prefix + lines[0], ...lines.slice(1)] : [this.prefix.trimEnd()];
   }
+  invalidate(): void { this.inner.invalidate?.(); }
+}
 
-  return {
-    render(width: number) {
-      const styled = output.split("\n").map((line: string) => theme.fg("toolOutput", line)).join("\n");
-      const visualLines = new Text(styled, 0, 0).render(width);
-      const shown = visualLines.slice(-displayLines);
-      const skipped = visualLines.length - shown.length;
-      const hint = skipped > 0
-        ? [theme.fg("muted", `... (${skipped} earlier lines, ${keyHint("app.tools.expand", "to expand")})`)]
-        : [];
-      return [...hint, ...shown, ...(warning ? [theme.fg("warning", `[${warning}]`)] : [])];
-    },
-    invalidate() {},
+/**
+ * Wraps a built-in `renderCall` so a call that runs on a remote project starts with an accent `[project] `.
+ * The built-in renderers reuse `context.lastComponent`, so it is handed back to them unwrapped.
+ * Without a label the built-in component is returned as is.
+ */
+export function withProjectPrefix<A, C extends { lastComponent?: Component }>(
+  renderCall: (args: A, theme: any, context: C) => Component,
+  labelFor: (args: A, context: any) => string | undefined,
+): (args: A, theme: any, context: C) => Component {
+  return (args, theme, context) => {
+    const previous = context.lastComponent instanceof PrefixedCall ? context.lastComponent : undefined;
+    const inner = renderCall(args, theme, previous ? { ...context, lastComponent: previous.inner } : context);
+    const label = labelFor(args, context);
+    if (!label) return inner;
+    const prefix = theme.fg("accent", `[${label}] `);
+    if (!previous) return new PrefixedCall(inner, prefix);
+    previous.inner = inner;
+    previous.prefix = prefix;
+    return previous;
   };
 }

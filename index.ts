@@ -23,7 +23,14 @@ import {
   createGrepTool,
   createLsTool,
   createReadTool,
+  createReadToolDefinition,
   createWriteTool,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
+  createWriteToolDefinition,
   formatSize,
   type BashOperations,
   type EditOperations,
@@ -32,14 +39,14 @@ import {
   type ReadOperations,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { quote, shellWords } from "./src/shell.ts";
 import { parseSshCommand, poolKey, type ParsedSsh } from "./src/ssh/config.ts";
 import { createSshAuthenticator, type SshCredentialCache } from "./src/ssh/auth.ts";
 import { buildFindScript, buildGrepScript, GrepCollector, grepLimits, LineSplitter, parseFindOutput } from "./src/remote-search.ts";
 import {
-  HOME_CWD, LOCAL_FOCUS, MAX_DISPLAY_LINES, DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_BYTES, DEFAULT_EXEC_MAX_LINES, DEFAULT_EXEC_MAX_BYTES,
+  HOME_CWD, LOCAL_FOCUS, DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_BYTES, DEFAULT_EXEC_MAX_LINES, DEFAULT_EXEC_MAX_BYTES,
   applyProjectFields, configuredDisplayLines, configuredOutputLimits, loadCatalog, migrateCatalogFile, parseAddArgs, parseDisplayLines,
   parseEditArgs, parseForwardSpec, parseOutputBytes, parseOutputLines, projectNameForSsh, saveCatalog, serializeForward,
   unknownProjectMessage, validateProjectName, type Catalog, type ForwardSpec, type ProjectFields,
@@ -54,14 +61,14 @@ import {
 } from "./src/context.ts";
 import {
   abortedError, DEFAULT_REMOTE_TIMEOUT_SECONDS, execRemote, execRemoteLimited, isDirectoryMode, isReconnectable, limitRemoteToolResult,
-  MAX_REMOTE_TIMEOUT_SECONDS, missingAsFalse, openAbortableExec, parseRemoteTimeout, remoteCommandLine, REMOTE_SEARCH_TIMEOUT_SECONDS,
+  missingAsFalse, openAbortableExec, parseRemoteTimeout, remoteCommandLine, REMOTE_SEARCH_TIMEOUT_SECONDS,
   runExecChannel, sftpCall, sftpStat, untilAborted, withSftp, writeRemoteFileAtomic,
   OUTPUT_FOOTER_RESERVE_BYTES,
 } from "./src/exec.ts";
 import { createKnownHosts, createPool, resolveCwd, type ConnectUi, type PoolConn } from "./src/pool.ts";
 import { focusLabel, formatProjectList, projectMemorySection, remotePrompt, renderPromptSections, type RemoteView } from "./src/prompt.ts";
 import { parseSessionState, SESSION_STATE_ENTRY_TYPE, type SessionState } from "./src/session.ts";
-import { askSecret, NON_INTERACTIVE_DIALOG_TIMEOUT_MS, previewRemoteOutput, renderRemoteControlCall, renderRemoteControlResult } from "./src/render.ts";
+import { askSecret, NON_INTERACTIVE_DIALOG_TIMEOUT_MS, previewRemoteOutput, renderRemoteControlCall, renderRemoteControlResult, withProjectPrefix } from "./src/render.ts";
 import { remoteArgumentCompletions, suppressRemoteCompletionsBeforeSuffix } from "./src/complete.ts";
 
 /** A project used in this session. `key`/`parsed` identify its pooled connection while connected. */
@@ -107,9 +114,12 @@ const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const MEMORY_DIR = join(AGENT_DIR, "ssh-remote-memories");
 const CACHE_KEY = "__piHpcCredentialCacheV1";
-const FILE_ROUTING = "When the focus is a remote project, this tool operates on that project.";
-const SHELL_ROUTING = "When the focus is a remote project, this tool runs in that project.";
-const REMOTE_ACTIONS = ["list", "add", "edit", "remove", "connect", "disconnect", "focus", "status", "chdir", "memory", "forward", "unforward", "exec", "forget"] as const;
+const ROUTING = "Runs on the focus unless target is set.";
+const TARGET_DESCRIPTION = 'Where to run: "local" or a remote project connected in this session (default: the current focus).';
+const REMOTE_ACTIONS = ["list", "add", "edit", "remove", "connect", "disconnect", "focus", "status", "chdir", "memory", "forward", "unforward", "forget"] as const;
+const EVENT_MESSAGE_TYPE = "ssh-remote-event";
+const EVENT_COALESCE_MS = 40;
+const IS_WINDOWS = process.platform === "win32";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>(), keyPassphrases: new Map<string, string>() };
 credentialCache.keyPassphrases ??= new Map<string, string>();
@@ -207,6 +217,35 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (currentCtx) currentCtx.ui.setStatus("ssh-remote", currentCtx.ui.theme.fg("warning", text));
   };
 
+  // ---- transcript notes ----------------------------------------------------------------------------------
+  // State changes the agent did not make itself (user /remote commands, automatic reconnects, dropped
+  // connections) are appended to the conversation so the model and the user see them. One note per burst.
+
+  const noteFocusLabel = (): string => {
+    const focused = focusedProject();
+    if (!focused) return LOCAL_FOCUS;
+    return focused.connected ? `${focused.name} (${focused.cwd})` : `${focused.name} (not connected)`;
+  };
+  const pendingNotes: string[] = [];
+  let noteTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const flushNotes = (): void => {
+    noteTimer = undefined;
+    const notes = pendingNotes.splice(0);
+    if (!notes.length || !sessionReady) return;
+    // triggerTurn:false never starts a run: while idle the message is appended now, while streaming it is held
+    // until the current turn's tool results are in (appending earlier would split a tool call from its result).
+    try { pi.sendMessage({ customType: EVENT_MESSAGE_TYPE, content: `[remote] ${notes.join("; ")}. Focus: ${noteFocusLabel()}.`, display: true }, { triggerTurn: false }); }
+    catch { /* a note is informational; never fail the operation that caused it */ }
+  };
+
+  const announce = (text: string): void => {
+    if (!sessionReady || restoringSessionState) return;
+    if (!pendingNotes.includes(text)) pendingNotes.push(text);
+    noteTimer ??= setTimeout(flushNotes, EVENT_COALESCE_MS);
+    noteTimer.unref?.();
+  };
+
   const uiFor = (ctx: any): ConnectUi => ({
     confirm: (title, message) => ctx.ui.confirm(title, message, ctx.mode !== "tui" ? { timeout: NON_INTERACTIVE_DIALOG_TIMEOUT_MS } : undefined),
     secret: (label, placeholder) => askSecret(ctx, label, placeholder),
@@ -239,6 +278,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const names = connectedUsing(key).map((p) => p.name).join(", ");
         currentCtx.ui.notify(notes.length ? `SSH remote reconnected (${names}); ${notes.join("; ")}` : `SSH remote reconnected automatically: ${names}`, notes.length ? "warning" : "info");
       }
+      announce(`Connection reconnected automatically: ${connectedUsing(key).map((p) => p.name).join(", ")}${notes.length ? ` (${notes.join("; ")})` : ""}`);
       return conn;
     })().finally(() => reconnecting.delete(key));
     reconnecting.set(key, attempt);
@@ -259,6 +299,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       status();
       persistSessionState();
       currentCtx?.ui.notify(`SSH remote automatic reconnection failed (${users.map((p) => p.name).join(", ")}): ${firstLine((error as Error).message)}`, "error");
+      announce(`Connection lost and automatic reconnection failed (${firstLine((error as Error).message)}); now disconnected: ${users.map((p) => p.name).join(", ")}`);
     }
   }
 
@@ -541,23 +582,29 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   // ---- remote file and shell operations ----------------------------------------------------------------
 
-  const mapPath = (rt: SessionProject, path: string): string => {
+  // Windows only: a POSIX remote path cannot go through path.resolve there, so the built-in tools keep resolving
+  // against the local cwd and paths under it are rewritten onto the remote cwd.
+  const mapLocalPath = (rt: SessionProject, path: string): string => {
     if (path === localCwd) return rt.cwd;
     const prefix = localCwd.endsWith(sep) ? localCwd : localCwd + sep;
     if (path.startsWith(prefix)) return rt.cwd.replace(/\/$/, "") + "/" + relative(localCwd, path).split(sep).join("/");
     return path;
   };
 
+  // Elsewhere the built-in tools run with the remote cwd as their cwd, so relative paths resolve against it and
+  // absolute paths arrive literally; nothing is rewritten.
+  const toRemote = (rt: SessionProject, path: string): string => IS_WINDOWS ? mapLocalPath(rt, path) : path;
+  const toolCwd = (rt: SessionProject): string => IS_WINDOWS ? localCwd : rt.cwd;
+
   const remotePath = (rt: SessionProject, path: string): string => {
     const normalized = path.replace(/^@/, "");
-    if (normalized.startsWith("/")) return mapPath(rt, normalized);
+    if (normalized.startsWith("/")) return toRemote(rt, normalized);
     return posix.join(rt.cwd, normalized);
   };
 
-  // Built-in tools resolve paths against ctx.cwd, but mapPath only translates paths under localCwd.
   // Object.create keeps Pi's lazy context getters and non-enumerable members that a spread would drop.
-  const remoteToolContext = <T extends { cwd: string }>(ctx: T): T =>
-    ctx && Object.create(ctx, { cwd: { value: localCwd, enumerable: true } });
+  const remoteToolContext = <T extends { cwd: string }>(ctx: T, rt: SessionProject): T =>
+    ctx && Object.create(ctx, { cwd: { value: toolCwd(rt), enumerable: true } });
 
   // AgentTool types execute with four parameters, but Pi's wrapper forwards a fifth context argument to the
   // tool definition, which reads the PI_* session variables, model, and cwd from it.
@@ -580,9 +627,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   const remoteReadOps = (rt: SessionProject): ReadOperations => ({
     readFile: (path) => withReconnect(rt, (client) => withSftp(client, (sftp) =>
-      new Promise<Buffer>((resolve, reject) => sftp.readFile(mapPath(rt, path), (error, data) => error ? reject(error) : resolve(data))))),
+      new Promise<Buffer>((resolve, reject) => sftp.readFile(toRemote(rt, path), (error, data) => error ? reject(error) : resolve(data))))),
     access: (path) => withReconnect(rt, (client) => withSftp(client, (sftp) =>
-      new Promise<void>((resolve, reject) => sftp.stat(mapPath(rt, path), (error) => error ? reject(error) : resolve())))),
+      new Promise<void>((resolve, reject) => sftp.stat(toRemote(rt, path), (error) => error ? reject(error) : resolve())))),
     detectImageMimeType: async (path) => {
       const mime = await detectRemoteMimeType(rt, path);
       return mime && IMAGE_MIME_TYPES.includes(mime) ? mime : null;
@@ -596,7 +643,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       new Promise<void>((resolve, reject) => sftp.stat(path, (error) => error ? reject(error) : resolve()))));
     const mime = await detectRemoteMimeType(rt, path);
     if (mime && IMAGE_MIME_TYPES.includes(mime)) {
-      const result = await withContext(createReadTool(localCwd, { operations: remoteReadOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx));
+      const result = await withContext(createReadTool(toolCwd(rt), { operations: remoteReadOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx, rt));
       return limitResult(result, "read", params.offset ?? 1);
     }
     if (mime && !isTextMimeType(mime)) throw new Error(`Refusing to read remote binary file as text (${mime}): ${params.path}`);
@@ -619,8 +666,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   };
 
   const remoteWriteOps = (rt: SessionProject): WriteOperations => ({
-    writeFile: (path, content) => withReconnect(rt, (client) => withSftp(client, (sftp) => writeRemoteFileAtomic(client, sftp, mapPath(rt, path), content))),
-    mkdir: async (path) => { await withReconnect(rt, (client) => execRemote(client, `mkdir -p -- ${quote(mapPath(rt, path))}`)); },
+    writeFile: (path, content) => withReconnect(rt, (client) => withSftp(client, (sftp) => writeRemoteFileAtomic(client, sftp, toRemote(rt, path), content))),
+    mkdir: async (path) => { await withReconnect(rt, (client) => execRemote(client, `mkdir -p -- ${quote(toRemote(rt, path))}`)); },
   });
 
   const remoteEditOps = (rt: SessionProject): EditOperations => {
@@ -629,15 +676,23 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return { readFile: read.readFile, access: read.access, writeFile: write.writeFile };
   };
 
+  type BashExecOptions = Parameters<BashOperations["exec"]>[2];
+  const execOnProject = async (rt: SessionProject, command: string, remoteCwd: string, { onData, signal, timeout }: BashExecOptions) => {
+    const timeoutSeconds = parseRemoteTimeout(timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
+    const full = remoteCommandLine(command, timeoutSeconds, remoteCwd);
+    const stream = await withReconnect(rt, (client) => openAbortableExec(client, full, signal), signal);
+    const { code, timedOut } = await runExecChannel(stream, timeoutSeconds, onData, onData, signal);
+    if (timedOut || code === 124 || code === 137) throw new Error(`timeout:${timeoutSeconds}`);
+    return { exitCode: code };
+  };
+
   const remoteBashOps = (rt: SessionProject): BashOperations => ({
-    exec: async (command, cwd, { onData, signal, timeout }) => {
-      const timeoutSeconds = parseRemoteTimeout(timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
-      const full = remoteCommandLine(command, timeoutSeconds, mapPath(rt, cwd));
-      const stream = await withReconnect(rt, (client) => openAbortableExec(client, full, signal), signal);
-      const { code, timedOut } = await runExecChannel(stream, timeoutSeconds, onData, onData, signal);
-      if (timedOut || code === 124 || code === 137) throw new Error(`timeout:${timeoutSeconds}`);
-      return { exitCode: code };
-    },
+    exec: (command, cwd, options) => execOnProject(rt, command, toRemote(rt, cwd), options),
+  });
+
+  // User `!` commands arrive with the local cwd; they always run in the project's session directory.
+  const userBashOps = (rt: SessionProject): BashOperations => ({
+    exec: (command, _cwd, options) => execOnProject(rt, command, rt.cwd, options),
   });
 
   // One SFTP session per ls call. readdir remembers each entry's type, so the built-in's per-entry stat
@@ -646,15 +701,15 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const result = await withReconnect(rt, (client) => withSftp(client, async (sftp) => {
       const isDirectoryByPath = new Map<string, boolean>();
       const operations: LsOperations = {
-        exists: (path) => sftpStat(sftp, mapPath(rt, path)).then(() => true, missingAsFalse),
+        exists: (path) => sftpStat(sftp, toRemote(rt, path)).then(() => true, missingAsFalse),
         stat: async (path) => {
           const known = isDirectoryByPath.get(path);
           if (known !== undefined) return { isDirectory: () => known };
-          const attrs = await sftpStat(sftp, mapPath(rt, path));
+          const attrs = await sftpStat(sftp, toRemote(rt, path));
           return { isDirectory: () => isDirectoryMode(attrs.mode) };
         },
         readdir: async (path) => {
-          const entries = await sftpCall<any[]>((done) => sftp.readdir(mapPath(rt, path), done));
+          const entries = await sftpCall<any[]>((done) => sftp.readdir(toRemote(rt, path), done));
           const names: string[] = [];
           for (const entry of entries) {
             if (entry.filename === "." || entry.filename === "..") continue;
@@ -664,7 +719,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           return names;
         },
       };
-      return withContext(createLsTool(localCwd, { operations })).execute(id, params, signal, update, remoteToolContext(ctx));
+      return withContext(createLsTool(toolCwd(rt), { operations })).execute(id, params, signal, update, remoteToolContext(ctx, rt));
     }), signal);
     return limitResult(result, "search");
   };
@@ -687,13 +742,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   const executeRemoteFind = async (rt: SessionProject, id: string, params: any, signal: AbortSignal | undefined, update: any, ctx: any) => {
     const operations: FindOperations = {
-      exists: (path) => withReconnect(rt, (client) => withSftp(client, (sftp) => sftpStat(sftp, mapPath(rt, path))), signal).then(() => true, missingAsFalse),
+      exists: (path) => withReconnect(rt, (client) => withSftp(client, (sftp) => sftpStat(sftp, toRemote(rt, path))), signal).then(() => true, missingAsFalse),
       glob: async (pattern, cwd, { limit }) => {
-        const dir = mapPath(rt, cwd);
+        const dir = toRemote(rt, cwd);
         return parseFindOutput(await captureRemoteScript(rt, buildFindScript(pattern, dir, limit), dir, signal), dir);
       },
     };
-    const result = await withContext(createFindTool(localCwd, { operations })).execute(id, params, signal, update, remoteToolContext(ctx));
+    const result = await withContext(createFindTool(toolCwd(rt), { operations })).execute(id, params, signal, update, remoteToolContext(ctx, rt));
     return limitResult(result, "search");
   };
 
@@ -749,21 +804,88 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   // ---- tool routing ------------------------------------------------------------------------------------
 
-  // The focused project's memory file is always read and edited locally, even while tools are routed.
+  // A project's memory file is always read and edited locally, whichever project a call is routed to.
   const targetsLocalProjectMemory = (path: unknown): boolean => {
-    if (focus === LOCAL_FOCUS || typeof path !== "string") return false;
-    return resolve(path.replace(/^@/, "")) === projectMemoryPath(MEMORY_DIR, focus);
+    if (typeof path !== "string" || !session.length) return false;
+    const resolved = resolve(path.replace(/^@/, ""));
+    return session.some((p) => resolved === projectMemoryPath(MEMORY_DIR, p.name));
   };
 
+  const notConnectedMessage = (name: string): string =>
+    `Remote project "${name}" is not connected in this session. Connect it first with remote(action="connect", name="${name}", focus=false); targeting does not change the focus.`;
+
   /**
-   * The project a built-in tool call runs on, or undefined to run locally. A remote focus that is not
-   * connected throws: routed tools never fall back to the local machine.
+   * The project a built-in tool call runs on, or undefined to run locally. Without `target` that is the focus
+   * (a remote focus that is not connected throws); with one, "local" or a connected session project. A named
+   * target never falls back to the local machine.
    */
-  const routeTarget = (path?: unknown): SessionProject | undefined => {
-    if (focus === LOCAL_FOCUS || targetsLocalProjectMemory(path)) return undefined;
-    const rt = focusedProject();
-    if (!rt) throw new Error(`Remote project ${focus} is not connected; reconnect with remote(action="connect", name="${focus}") or switch focus to local`);
-    return requireConnected(rt);
+  const resolveTarget = (target: unknown, path?: unknown): SessionProject | undefined => {
+    const name = typeof target === "string" ? target.trim() : "";
+    if (!name) {
+      if (focus === LOCAL_FOCUS || targetsLocalProjectMemory(path)) return undefined;
+      const rt = focusedProject();
+      if (!rt) throw new Error(`Remote project ${focus} is not connected; reconnect with remote(action="connect", name="${focus}") or switch focus to local`);
+      return requireConnected(rt);
+    }
+    if (name === LOCAL_FOCUS) return undefined;
+    const rt = findSession(name);
+    if (!rt?.connected) {
+      if (rt || catalog().projects[name]) throw new Error(notConnectedMessage(name));
+      const connected = session.filter((p) => p.connected).map((p) => p.name);
+      throw new Error(`Unknown target "${name}". Use "local"${connected.length ? ` or a connected project: ${connected.join(", ")}` : ""}.`);
+    }
+    return targetsLocalProjectMemory(path) ? undefined : rt;
+  };
+
+  // Where each call ran (project name, or undefined for local), keyed by tool call id, so a call header keeps
+  // its prefix after the focus changes. Bounded; only the recent calls are ever re-rendered.
+  const ranOn = new Map<string, string | undefined>();
+  const recordRoute = (toolCallId: string, rt: SessionProject | undefined): void => {
+    ranOn.set(toolCallId, rt?.name);
+    if (ranOn.size > 500) ranOn.delete(ranOn.keys().next().value!);
+  };
+
+  /** The project a call header should name, or undefined for a local call. */
+  const callLabel = (args: any, context: { toolCallId?: string; executionStarted?: boolean }): string | undefined => {
+    if (context.toolCallId && ranOn.has(context.toolCallId)) return ranOn.get(context.toolCallId);
+    const target = typeof args?.target === "string" ? args.target.trim() : "";
+    if (target) return target === LOCAL_FOCUS ? undefined : target;
+    // Before the call has started, the focus is where it will run; later (resumed sessions) it is unknown.
+    return !context.executionStarted && focus !== LOCAL_FOCUS ? focus : undefined;
+  };
+
+  const targetSchema = Type.Optional(Type.String({ description: TARGET_DESCRIPTION }));
+
+  interface RoutedTool {
+    local: () => WithContext<any>;
+    definition: any;
+    description: string;
+    promptGuidelines?: string[];
+    defaultActive?: false;
+    remote: (rt: SessionProject, id: string, params: any, signal: AbortSignal | undefined, update: any, ctx: any) => Promise<any>;
+  }
+
+  // Registers a built-in tool with the optional `target` parameter, a call header that names the project it
+  // runs on, and routing to the target (or the focus) over its pooled connection.
+  const registerRoutedTool = ({ local, definition, description, promptGuidelines, defaultActive, remote }: RoutedTool): void => {
+    const builtIn = local();
+    pi.registerTool({
+      ...builtIn,
+      description,
+      ...(promptGuidelines ? { promptGuidelines } : {}),
+      // Like the built-in, active only when enabled (defaultTools / --tools), not on registration.
+      ...(defaultActive === false ? { defaultActive } : {}),
+      parameters: Type.Object({ ...(builtIn.parameters as any).properties, target: targetSchema }),
+      renderShell: definition.renderShell,
+      renderCall: definition.renderCall && withProjectPrefix(definition.renderCall, callLabel),
+      renderResult: definition.renderResult,
+      execute: async (id: string, params: any, signal: AbortSignal | undefined, update: any, ctx: any) => {
+        const { target, ...rest } = params ?? {};
+        const rt = resolveTarget(target, rest.path);
+        recordRoute(id, rt);
+        return rt ? remote(rt, id, rest, signal, update, ctx) : local().execute(id, rest, signal, update, ctx);
+      },
+    } as any);
   };
 
   const localRead = withContext(createReadTool(localCwd));
@@ -773,73 +895,55 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const localGrep = withContext(createGrepTool(localCwd));
   const localFind = withContext(createFindTool(localCwd));
   const localLs = withContext(createLsTool(localCwd));
-  pi.registerTool({
-    ...localRead,
-    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue. ${FILE_ROUTING}`,
+  registerRoutedTool({
+    local: () => localRead,
+    definition: createReadToolDefinition(localCwd),
+    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue. ${ROUTING}`,
     promptGuidelines: ["Use read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget(params.path);
-      return rt ? executeRemoteRead(rt, id, params, signal, update, ctx) : localRead.execute(id, params, signal, update, ctx);
-    },
+    remote: executeRemoteRead,
   });
-  pi.registerTool({
-    ...localWrite,
-    description: `${localWrite.description} ${FILE_ROUTING}`,
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget(params.path);
-      return rt
-        ? withContext(createWriteTool(localCwd, { operations: remoteWriteOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx))
-        : localWrite.execute(id, params, signal, update, ctx);
-    },
+  registerRoutedTool({
+    local: () => localWrite,
+    definition: createWriteToolDefinition(localCwd),
+    description: `${localWrite.description} ${ROUTING}`,
+    remote: (rt, id, params, signal, update, ctx) =>
+      withContext(createWriteTool(toolCwd(rt), { operations: remoteWriteOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx, rt)),
   });
-  pi.registerTool({
-    ...localEdit,
-    description: `${localEdit.description} ${FILE_ROUTING}`,
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget(params.path);
-      return rt
-        ? withContext(createEditTool(localCwd, { operations: remoteEditOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx))
-        : localEdit.execute(id, params, signal, update, ctx);
-    },
+  registerRoutedTool({
+    local: () => localEdit,
+    definition: createEditToolDefinition(localCwd),
+    description: `${localEdit.description} ${ROUTING}`,
+    remote: (rt, id, params, signal, update, ctx) =>
+      withContext(createEditTool(toolCwd(rt), { operations: remoteEditOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx, rt)),
   });
-  pi.registerTool({
-    ...localGrep,
-    // Like the built-in, active only when enabled (defaultTools / --tools), not on registration.
+  registerRoutedTool({
+    local: () => localGrep,
+    definition: createGrepToolDefinition(localCwd),
     defaultActive: false,
-    description: `${localGrep.description} ${FILE_ROUTING}`,
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget(params.path);
-      return rt ? executeRemoteGrep(rt, params, signal) : localGrep.execute(id, params, signal, update, ctx);
-    },
+    description: `${localGrep.description} ${ROUTING}`,
+    remote: (rt, _id, params, signal) => executeRemoteGrep(rt, params, signal),
   });
-  pi.registerTool({
-    ...localFind,
+  registerRoutedTool({
+    local: () => localFind,
+    definition: createFindToolDefinition(localCwd),
     defaultActive: false,
-    description: `${localFind.description} ${FILE_ROUTING}`,
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget(params.path);
-      return rt ? executeRemoteFind(rt, id, params, signal, update, ctx) : localFind.execute(id, params, signal, update, ctx);
-    },
+    description: `${localFind.description} ${ROUTING}`,
+    remote: executeRemoteFind,
   });
-  pi.registerTool({
-    ...localLs,
+  registerRoutedTool({
+    local: () => localLs,
+    definition: createLsToolDefinition(localCwd),
     defaultActive: false,
-    description: `${localLs.description} ${FILE_ROUTING}`,
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget(params.path);
-      return rt ? executeRemoteLs(rt, id, params, signal, update, ctx) : localLs.execute(id, params, signal, update, ctx);
-    },
+    description: `${localLs.description} ${ROUTING}`,
+    remote: executeRemoteLs,
   });
-  pi.registerTool({
-    ...localBash,
-    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally. ${SHELL_ROUTING}`,
+  registerRoutedTool({
+    local: () => localBash,
+    definition: createBashToolDefinition(localCwd),
+    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally. ${ROUTING}`,
     promptGuidelines: ["When using bash for remote logs and broad searches, use bounded commands such as tail, sed, or rg with limits instead of cat or unbounded find output."],
-    execute: async (id, params, signal, update, ctx) => {
-      const rt = routeTarget();
-      if (!rt) return localBash.execute(id, params, signal, update, ctx);
-      const result = await withContext(createBashTool(localCwd, { operations: remoteBashOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx));
-      return limitResult(result, "exec");
-    },
+    remote: async (rt, id, params, signal, update, ctx) =>
+      limitResult(await withContext(createBashTool(toolCwd(rt), { operations: remoteBashOps(rt) })).execute(id, params, signal, update, remoteToolContext(ctx, rt)), "exec"),
   });
 
   // ---- the remote tool and /remote command -------------------------------------------------------------
@@ -926,26 +1030,23 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "remote",
     label: "Remote",
-    description: "Manage saved remote SSH projects and which one tools run on. Connecting a project focuses it; while focus is a remote project, read, write, edit, bash, grep, find, and ls run there, and focus local returns them to this machine.",
+    description: "Manage saved remote SSH projects and the focus, where read, write, edit, bash, grep, find, and ls run by default. connect focuses the project unless focus=false; focus local returns to this machine.",
     promptSnippet: "Manage remote SSH projects and the tool focus",
     promptGuidelines: [
-      "Find saved projects with remote list and connect by exact name; switch with focus. Use chdir, not exec, to change a project's directory.",
+      "Find saved projects with remote list and connect by exact name; switch with focus. Use chdir to change a project's directory.",
       "Use remote add or edit only when the user asks to save or change a project; use remove only on an explicit user request.",
       "remote memory returns a project's memory file path; read/edit that file directly and delete entries only on an explicit user request.",
-      `Set timeout for remote exec (default ${DEFAULT_REMOTE_TIMEOUT_SECONDS}s) and keep output bounded (tail, sed, rg limits).`,
     ],
     parameters: Type.Object({
       action: StringEnum(REMOTE_ACTIONS),
       name: Type.Optional(Type.String({ description: "Exact project name (focus also accepts local)" })),
       ssh: Type.Optional(Type.String({ description: "ssh command or target, e.g. me@host or an ~/.ssh/config alias" })),
-      cwd: Type.Optional(Type.String({ description: "Remote directory (~ ok); chdir target; exec one-command override" })),
+      cwd: Type.Optional(Type.String({ description: "Remote directory (~ ok), for add, edit, and chdir" })),
       note: Type.Optional(Type.String({ description: "One-line note; empty clears" })),
       guard: Type.Optional(Type.String({ description: "readonly or confirm (not yet enforced); empty clears" })),
       local: Type.Optional(Type.String({ description: "Local checkout path (informational); empty clears" })),
       forwards: Type.Optional(Type.String({ description: "Space-separated LOCAL_PORT:REMOTE_HOST:REMOTE_PORT" })),
-      remoteCommand: Type.Optional(Type.String({ description: "Shell command for exec" })),
-      timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_REMOTE_TIMEOUT_SECONDS, description: "Exec timeout in seconds" })),
-      displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DISPLAY_LINES, description: "Collapsed exec preview lines" })),
+      focus: Type.Optional(Type.Boolean({ description: "connect only: false keeps the current focus" })),
     }),
     async execute(_id, params, signal, _update, ctx) {
       currentCtx = ctx;
@@ -984,8 +1085,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         }
         case "connect": {
           if (!params.name) throw new Error("connect requires name");
-          const rt = await connectProject(params.name, ctx);
-          return actionResult(`Connected: ${describe(rt)}`, contextDetails(rt), switchContextText(rt));
+          const rt = await connectProject(params.name, ctx, { focus: params.focus });
+          return actionResult(`Connected${params.focus === false ? " (focus unchanged)" : ""}: ${describe(rt)}`, contextDetails(rt), switchContextText(rt));
         }
         case "focus": {
           if (!params.name) throw new Error('focus requires name (a session project or "local")');
@@ -1035,30 +1136,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           persistSessionState();
           return { content: [{ type: "text", text: name ? `Closed port forwards for ${name}.` : "Closed all extension-managed port forwards." }], details: { project: name } };
         }
-        case "exec": {
-          if (!params.remoteCommand) throw new Error("remoteCommand is required for exec");
-          const rt = requireConnected(sessionTarget(params.name, "run the command on"));
-          const cdTarget = params.cwd === undefined ? standaloneCdTarget(params.remoteCommand) : undefined;
-          if (cdTarget !== undefined) {
-            const resolved = await changeCwd(rt, cdTarget, ctx);
-            return { content: [{ type: "text", text: resolved }], details: { project: rt.name, cwd: resolved } };
-          }
-          const displayLines = parseDisplayLines(params.displayLines ?? configuredDisplayLines(projects));
-          const formatted = await runExec(rt, params.remoteCommand, { timeout: params.timeout, cwd: params.cwd, signal });
-          return limitResult({
-            content: [{ type: "text", text: formatted.text }],
-            details: {
-              action: "exec",
-              project: rt.name,
-              cwd: rt.cwd,
-              displayLines,
-              output: formatted.content,
-              modelLimited: true,
-              truncation: formatted.truncation.truncated ? formatted.truncation : undefined,
-              fullOutputPath: formatted.fullOutputPath,
-            },
-          }, "exec");
-        }
       }
     },
     renderCall(params, theme) {
@@ -1076,10 +1153,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return { value: name, label: name, description: `${state}: ${project.ssh}, ${project.cwd}` };
     });
 
-  const REMOTE_USAGE = "Usage: /remote [list] | add NAME SSH CWD [NOTE...] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | memory [NAME] | cd PATH | exec [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config [KEY N]";
+  const REMOTE_USAGE = "Usage: /remote [list] | add NAME SSH CWD [NOTE...] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | memory [NAME] | cd PATH | exec [--on NAME] [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config [KEY N]";
 
   pi.registerCommand("remote", {
-    description: "Manage remote SSH projects: /remote [list] | add NAME SSH CWD [NOTE] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | memory [NAME] | cd PATH | exec [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config",
+    description: "Manage remote SSH projects: /remote [list] | add NAME SSH CWD [NOTE] | edit NAME key=value... | remove NAME | connect NAME | focus NAME|local | disconnect [NAME] | status | memory [NAME] | cd PATH | exec [--on NAME] [--timeout S] [--lines N] COMMAND | forward [MAPPINGS] | unforward | forget [NAME] | ssh ARGS... | config",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => remoteArgumentCompletions(prefix, projectCompletionItems),
     handler: async (args, ctx) => {
       currentCtx = ctx;
@@ -1114,22 +1191,26 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             projects.projects[name] = updated;
             saveCatalog(CONFIG_FILE, projects);
             status(ctx);
+            announce(`User edited project ${name} (${updated.ssh}, ${updated.cwd})`);
             return info(`Updated remote project ${name} (${updated.ssh}, ${updated.cwd}${updated.note ? `; ${updated.note}` : ""})`);
           }
           case "remove": {
             if (!rest) throw new Error("Usage: /remote remove NAME");
             await removeProject(rest, ctx);
+            announce(`User removed project ${rest}`);
             return info(`Removed remote project ${rest}; its memory file was kept`);
           }
           case "connect": {
             if (!rest) throw new Error("Usage: /remote connect NAME");
             const rt = await connectProject(rest, ctx);
+            announce(`User connected ${describe(rt)}`);
             const notice = contextNotice(rt);
             return ctx.ui.notify(notice.text, notice.level);
           }
           case "focus": {
             if (!rest) throw new Error("Usage: /remote focus NAME|local");
             const rt = await focusProject(rest, ctx);
+            announce(`User switched focus to ${rt ? describe(rt) : LOCAL_FOCUS}`);
             if (!rt) return info("Focus: local");
             const notice = contextNotice(rt);
             return ctx.ui.notify(`Focus: ${describe(rt)}. ${notice.text}`, notice.level);
@@ -1137,12 +1218,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           case "disconnect": {
             const name = rest || (focus !== LOCAL_FOCUS ? focus : "");
             if (!name) return info("Focus is already local; use /remote disconnect NAME");
-            return await disconnectProject(name, ctx);
+            await disconnectProject(name, ctx);
+            return announce(`User disconnected ${name}`);
           }
           case "forget": {
             const name = rest || (focus !== LOCAL_FOCUS ? focus : "");
             if (!name) throw new Error("Usage: /remote forget NAME");
-            return await disconnectProject(name, ctx, true);
+            await disconnectProject(name, ctx, true);
+            return announce(`User disconnected ${name} and cleared its cached credentials`);
           }
           case "memory": {
             const name = rest || (focus !== LOCAL_FOCUS ? focus : "");
@@ -1153,21 +1236,27 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           }
           case "cd": {
             const rt = requireConnected(sessionTarget(undefined, "change directory for"));
-            return info(`${rt.name} path: ${await changeCwd(rt, rest || HOME_CWD, ctx)}`);
+            const resolved = await changeCwd(rt, rest || HOME_CWD, ctx);
+            announce(`User changed ${rt.name} directory to ${resolved}`);
+            return info(`${rt.name} path: ${resolved}`);
           }
           case "exec": {
-            const rt = requireConnected(sessionTarget(undefined, "run the command on"));
             let execInput = rest;
             let displayLines = configuredDisplayLines(catalog());
             let timeoutSeconds = DEFAULT_REMOTE_TIMEOUT_SECONDS;
+            let onName: string | undefined;
             while (execInput.startsWith("--")) {
-              const option = execInput.match(/^--(lines|timeout)\s+(\S+)\s+([\s\S]+)$/i);
-              if (!option) throw new Error("Expected --lines N or --timeout SECONDS followed by a command");
-              if (option[1]!.toLowerCase() === "lines") displayLines = parseDisplayLines(option[2]);
+              const option = execInput.match(/^--(lines|timeout|on)\s+(\S+)\s+([\s\S]+)$/i);
+              if (!option) throw new Error("Expected --on NAME, --lines N or --timeout SECONDS followed by a command");
+              const flag = option[1]!.toLowerCase();
+              if (flag === "lines") displayLines = parseDisplayLines(option[2]);
+              else if (flag === "on") onName = option[2];
               else timeoutSeconds = parseRemoteTimeout(option[2]);
               execInput = option[3]!;
             }
-            if (!execInput) throw new Error("Usage: /remote exec [--timeout S] [--lines N] COMMAND");
+            if (!execInput) throw new Error("Usage: /remote exec [--on NAME] [--timeout S] [--lines N] COMMAND");
+            if (!onName && focus === LOCAL_FOCUS) throw new Error("The focus is local; use /remote exec --on NAME COMMAND");
+            const rt = requireConnected(sessionTarget(onName, "run the command on"));
             const formatted = await runExec(rt, execInput, { timeout: timeoutSeconds });
             const omitted = formatted.truncation.totalLines > displayLines
               ? `\n\n[Showing last ${Math.min(displayLines, formatted.truncation.totalLines)} of ${formatted.truncation.totalLines} lines]`
@@ -1195,6 +1284,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
               saveCatalog(CONFIG_FILE, projects);
             }
             const rt = await connectProject(name, ctx);
+            announce(`User connected ${describe(rt)}`);
             const notice = contextNotice(rt);
             return ctx.ui.notify(notice.text, notice.level);
           }
@@ -1229,6 +1319,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
 
   // ---- events ------------------------------------------------------------------------------------------
+
+  // Optional (older hosts may lack it): a muted one-line note instead of the default labelled box.
+  pi.registerMessageRenderer?.(EVENT_MESSAGE_TYPE, (message: any, options: any, theme: any) => {
+    const text = typeof message.content === "string" ? message.content : (message.content ?? []).map((part: any) => part.text ?? "").join("\n");
+    return new Text(theme.fg("muted", text), options?.outputPad ?? 1, 0);
+  });
 
   pi.on("turn_start", () => { turnBudget.used = 0; });
   pi.on("session_start", async (event, ctx) => {
@@ -1287,6 +1383,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async (event) => {
     sessionReady = false;
+    clearTimeout(noteTimer);
+    noteTimer = undefined;
+    pendingNotes.length = 0;
+    ranOn.clear();
     const preserve = event.reason === "reload" || event.reason === "new" || event.reason === "fork";
     if (preserve && session.length) {
       credentialCache.projectsResume = {
@@ -1311,7 +1411,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       requireConnected(rt);
     } catch (error) { return failure((error as Error).message); }
     const cdTarget = standaloneCdTarget(event.command);
-    if (cdTarget === undefined) return { operations: remoteBashOps(rt) };
+    if (cdTarget === undefined) return { operations: userBashOps(rt) };
     try {
       const resolved = await changeCwd(rt, cdTarget, ctx);
       return { result: { output: resolved, exitCode: 0, cancelled: false, truncated: false } };

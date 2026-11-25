@@ -51,6 +51,16 @@ gpu-box:/srv/project  ● befaq-prod  ○ staging
 
 每个会话记录自己用过的项目列表和一个**焦点**：`local` 或其中某个项目。焦点在远程项目时，Pi 的文件工具、Shell 工具和 `!` 用户命令都会通过 SSH 透明执行。切换是显式的（`/remote focus NAME|local`），Agent 可以在两台服务器之间对比，或回到本地代码库，而不用重新连接。如果焦点项目断线且无法重连，被路由的工具会返回明确的错误，绝不会悄悄回退到本地执行。
 
+### 一轮对话里操作多个项目
+
+`read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 都有可选参数 `target`：`"local"`，或本会话中已连接的项目名。不传时仍跟随焦点。这样 Agent 可以在同一轮里对比 `prod` 和 `staging`，或把远程项目里的片段复制到本地代码库，而不必来回切换焦点。用 `remote(action="connect", name="staging", focus=false)` 可以连接项目但不改变焦点。目标已保存但未连接、或名称不存在时，工具会报错并说明如何连接（或列出已连接的项目）；指定目标绝不会悄悄回退到本地。每个工具调用的标题前会显示 `[项目名]` 前缀标明执行位置（本地调用没有前缀），不同项目的调用使用各自的连接池连接和会话目录。
+
+相对路径按目标项目的会话目录解析，绝对路径按原样使用：本地目录下的绝对路径不会再被改写成远程路径（Windows 主机上仍会把本地目录下的路径映射到远程目录）。项目记忆文件无论目标是谁，始终在本地读写。
+
+### 非 Agent 引起的变化会写入对话
+
+当远程状态的变化不是 Agent 自己调用 `remote` 工具造成的（你执行了 `/remote connect`、`focus`、`disconnect`、`forget`、`cd`、`edit`、`remove`、`ssh`，或连接断开后自动重连成功/失败），对话中会追加一行说明，例如 `[remote] User switched focus to local. Focus: local.`。它不会触发新的一轮；短时间内的多次变化会合并为一条；会话启动或恢复时不会添加。
+
 ### 断线后可以自动恢复
 
 同一主机上的项目共享一条 SSH 连接；只要还有已连接项目在使用，连接意外断开时插件就会自动重连。会话会记住自己的项目列表：`/resume` 会把所有项目恢复为未连接状态并把焦点放回 local（不会自动连接）；`/reload`、`/new` 和 fork 则会在交互式 TUI 中重新连接之前已连接的项目。
@@ -231,13 +241,13 @@ Pi 只会从本地目录树加载 `AGENTS.md` 和 `CLAUDE.md`，远程项目自�
 | `/remote add NAME SSH CWD [备注...]` | 保存项目；SSH 可用带引号的完整命令或裸目标 |
 | `/remote edit NAME key=value...` | 修改 `ssh`、`cwd`、`note`、`guard`、`local`、`forwards`；`key=` 清除可选字段。值会持续到下一个 `key=`，所以 `note=Staging server` 不需要引号 |
 | `/remote remove NAME` | 删除已保存项目（保留其记忆文件） |
-| `/remote connect NAME` | 连接项目（精确名称）并聚焦 |
+| `/remote connect NAME` | 连接项目（精确名称）并聚焦（Agent 的 `connect` 还支持 `focus=false`） |
 | `/remote focus NAME\|local` | 把工具切到某个会话项目或回到本地；未连接的会话项目会被重新连接 |
 | `/remote disconnect [NAME]` | 断开项目（默认当前焦点）；若它有焦点则焦点回到 local |
 | `/remote status` | 查看焦点、本会话的项目，以及当前项目已加载的指令文件和记忆条目数 |
 | `/remote memory [NAME]` | 展示项目的记忆条目、ID 和文件 |
 | `/remote cd PATH` | 修改当前聚焦项目在本会话中的工作目录 |
-| `/remote exec [--timeout S] [--lines N] COMMAND` | 在当前聚焦项目中执行一次命令 |
+| `/remote exec [--on NAME] [--timeout S] [--lines N] COMMAND` | 在当前聚焦项目（或指定的会话项目 `NAME`）中执行一次命令 |
 | `/remote forward [MAPPING...]` | 为当前聚焦项目启动端口转发（默认使用其已保存的 `forwards`） |
 | `/remote unforward` | 停止插件创建的端口转发（当前聚焦项目的；焦点为 local 时停止全部） |
 | `/remote forget [NAME]` | 断开连接并清除该项目各跳的内存密码和密钥 passphrase |
@@ -252,7 +262,7 @@ Pi 只会从本地目录树加载 `AGENTS.md` 和 `CLAUDE.md`，远程项目自�
 
 ### `remote` 工具
 
-Agent 使用一个工具，包含这些 action：`list`、`add`、`edit`、`remove`、`connect`、`disconnect`、`focus`、`status`、`chdir`、`memory`、`forward`、`unforward`、`exec`、`forget`。`connect` 需要精确的项目名称，名称不存在时会返回几个相近的已保存项目。`remove` 只用于用户明确提出的请求。密码和密钥 passphrase 绝不会作为参数接收。
+Agent 使用一个工具，包含这些 action：`list`、`add`、`edit`、`remove`、`connect`、`disconnect`、`focus`、`status`、`chdir`、`memory`、`forward`、`unforward`、`forget`。`connect` 需要精确的项目名称（名称不存在时会返回几个相近的已保存项目），并支持 `focus=false`：只连接、不改变焦点。命令通过 `bash` 执行（用其 `target` 指定其他项目）；原来的 `exec` action 已移除。`remove` 只用于用户明确提出的请求。密码和密钥 passphrase 绝不会作为参数接收。
 
 ### 斜杠命令补全
 

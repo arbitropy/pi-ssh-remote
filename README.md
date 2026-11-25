@@ -28,6 +28,16 @@ A remote project is a name plus an SSH command and a working directory, for exam
 
 Each session keeps an ordered list of the projects it has used and a **focus**: `local` or one of those projects. While a remote project has the focus, Pi's file tools, shell tool, and `!` user shell commands are transparently routed over SSH. Switching is explicit (`/remote focus NAME|local`), so the agent can compare two servers or hop back to the local checkout without reconnecting. If the focused project loses its connection and cannot reconnect, routed tools fail with a clear error; they never silently fall back to the local machine.
 
+### Act on several projects in one turn
+
+`read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` take an optional `target`: `"local"` or the name of a project connected in this session. Without it they follow the focus. The agent can therefore compare `prod` and `staging`, or copy a snippet from a remote project into the local checkout, without switching focus back and forth. Connect a project without taking the focus with `remote(action="connect", name="staging", focus=false)`. A target that is saved but not connected, or unknown, fails with a message saying how to connect it (or which projects are connected); a target never silently falls back to local. Each call header shows where it ran as a `[project]` prefix (nothing for local), and calls to different projects use their own pooled connections and session directories.
+
+Relative paths resolve against the target's session directory, and absolute paths are used as given: an absolute path under the local folder is no longer rewritten onto the remote (on Windows hosts, paths under the local folder are still mapped to the remote directory). A project's memory file is always read and edited locally, whichever project a call targets.
+
+### Changes you make are visible to the agent
+
+When the remote state changes without the agent's own `remote` tool call (you run `/remote connect`, `focus`, `disconnect`, `forget`, `cd`, `edit`, `remove`, or `ssh`; a dropped connection is re-established or cannot be), a one-line note such as `[remote] User switched focus to local. Focus: local.` is added to the conversation. It never starts a turn, rapid changes are merged into one note, and nothing is added when a session starts or resumes.
+
 ### Agent control plane, human control plane
 
 The extension exposes `remote` for the agent and `/remote` for the user. You can ask Pi to connect, switch focus, change directory, run a command, create a tunnel, or return to local work in natural language, and still take direct control whenever you want.
@@ -212,13 +222,13 @@ tools on the local repository.
 | `/remote add NAME SSH CWD [NOTE...]` | Save a project; quote a full ssh command or pass a bare target |
 | `/remote edit NAME key=value...` | Change `ssh`, `cwd`, `note`, `guard`, `local`, or `forwards`; `key=` clears an optional field. A value runs until the next `key=`, so `note=Staging server` needs no quotes |
 | `/remote remove NAME` | Delete a saved project (its memory file is kept) |
-| `/remote connect NAME` | Connect a project (exact name) and focus it |
+| `/remote connect NAME` | Connect a project (exact name) and focus it (the agent's `connect` also accepts `focus=false`) |
 | `/remote focus NAME\|local` | Send tools to a session project or back to local; a disconnected session project is reconnected |
 | `/remote disconnect [NAME]` | Disconnect a project (default: the focused one); focus returns to local if it was focused |
 | `/remote status` | Show the focus, the session's projects, and the focused project's loaded instruction files and memory entry count |
 | `/remote memory [NAME]` | Show a project's memory entries, IDs, and file |
 | `/remote cd PATH` | Change the focused project's working directory for this session |
-| `/remote exec [--timeout S] [--lines N] COMMAND` | Run one command in the focused project |
+| `/remote exec [--on NAME] [--timeout S] [--lines N] COMMAND` | Run one command in the focused project, or in session project `NAME` |
 | `/remote forward [MAPPING...]` | Forward local ports to the focused project's network (default: its saved `forwards`) |
 | `/remote unforward` | Stop extension-managed forwards (the focused project's, or all when the focus is local) |
 | `/remote forget [NAME]` | Disconnect and clear cached passwords and key passphrases for the project's hops |
@@ -233,7 +243,7 @@ Project names use lowercase letters, digits, `.`, `_`, and `-` (up to 64 charact
 
 ### The `remote` tool
 
-The agent uses one tool with these actions: `list`, `add`, `edit`, `remove`, `connect`, `disconnect`, `focus`, `status`, `chdir`, `memory`, `forward`, `unforward`, `exec`, and `forget`. `connect` needs the exact project name; an unknown name returns a short list of similar saved projects. `remove` is only for explicit user requests. Passwords and key passphrases are never accepted as arguments.
+The agent uses one tool with these actions: `list`, `add`, `edit`, `remove`, `connect`, `disconnect`, `focus`, `status`, `chdir`, `memory`, `forward`, `unforward`, and `forget`. `connect` needs the exact project name (an unknown name returns a short list of similar saved projects) and takes `focus=false` to connect without changing the focus. Commands run through `bash` (use its `target` for another project); the former `exec` action is gone. `remove` is only for explicit user requests. Passwords and key passphrases are never accepted as arguments.
 
 ### Slash-command completion
 

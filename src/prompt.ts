@@ -35,6 +35,9 @@ export function remotePrompt(view: RemoteView): string {
       ? `- ${p.name}: ${sshOf(view, p.name)}, ${p.cwd}. Connected.${project?.guard ? ` Guard: ${project.guard}.` : ""}${project?.note ? ` Note: ${project.note}` : ""}`
       : `- ${p.name}: ${sshOf(view, p.name)}, ${p.cwd}. Disconnected; reconnect with remote(action="connect", name="${p.name}").`);
   }
+  if (view.session.some((p) => p.connected)) {
+    lines.push('Pass target="<name>" (or "local") to read/write/edit/bash/grep/find/ls to act on another connected project without switching focus. Connect first: remote(action="connect", name, focus=false).');
+  }
   const more = Object.keys(view.projects).filter((name) => !view.session.some((p) => p.name === name)).length;
   lines.push(`Switch with remote(action="focus", name="<name>" | "local").${more ? ` ${more} more saved: remote(action="list").` : ""}`);
   return lines.join("\n");
