@@ -10,6 +10,7 @@ import type { Client as SshClient, ClientChannel, SFTPWrapper } from "ssh2";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
+import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -21,6 +22,9 @@ import {
   DEFAULT_MAX_LINES,
   createBashTool,
   createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
   createReadTool,
   createWriteTool,
   formatSize,
@@ -29,6 +33,8 @@ import {
   truncateTail,
   type BashOperations,
   type EditOperations,
+  type FindOperations,
+  type LsOperations,
   type ReadOperations,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
@@ -48,6 +54,7 @@ import { quote, shellWords } from "./src/shell.ts";
 import { cacheId, parseSshCommand, type ParsedSsh } from "./src/ssh/config.ts";
 import { createSshAuthenticator, type SshCredentialCache } from "./src/ssh/auth.ts";
 import { jumpSocket, probeFingerprint } from "./src/ssh/connection.ts";
+import { buildFindScript, buildGrepScript, GrepCollector, grepLimits, LineSplitter, parseFindOutput } from "./src/remote-search.ts";
 
 interface RemoteState extends ParsedSsh {
   client: SshClient;
@@ -141,6 +148,7 @@ const DEFAULT_TURN_MAX_BYTES = 32 * 1024;
 const MIN_MODEL_OUTPUT_BYTES = 1024;
 const OUTPUT_FOOTER_RESERVE_BYTES = 512;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 30;
+const REMOTE_SEARCH_TIMEOUT_SECONDS = 60;
 const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 // Bounds interactive dialogs (secret prompts, host-key trust, command input) on
 // non-interactive hosts such as RPC: the host may never answer, and an unbounded
@@ -204,6 +212,12 @@ function parseRemoteTimeout(value: unknown): number {
 
 function withRemoteTimeout(command: string, timeoutSeconds: number): string {
   return `timeout --signal=TERM --kill-after=5s ${timeoutSeconds}s bash -lc ${quote(command)}`;
+}
+
+// `exec` replaces the login shell with `timeout`, so a TERM signal request on the channel reaches
+// the whole process tree instead of only the shell.
+function remoteCommandLine(command: string, timeoutSeconds: number, cwd?: string): string {
+  return `${cwd === undefined ? "" : `cd -- ${quote(cwd)} && `}exec ${withRemoteTimeout(command, timeoutSeconds)}`;
 }
 
 function configuredDisplayLines(config = loadRemoteConfig()): number {
@@ -516,7 +530,7 @@ function memoryManagementPrompt(remote: RemoteState): string {
 }
 
 function remoteWorkspacePrompt(remote: RemoteState): string {
-  return `SSH workspace: ${endpointDisplayLabel(remote, remote.cwd)}. The standard read, write, edit, and bash tools and user shell commands operate directly in this workspace.`;
+  return `SSH workspace: ${endpointDisplayLabel(remote, remote.cwd)}. The standard read, write, edit, grep, find, ls, and bash tools and user shell commands operate directly in this workspace.`;
 }
 
 /** Renders prompt sections as tagged blocks for hosts that expose only the rendered system prompt. */
@@ -740,14 +754,14 @@ function execRemote(
 ): Promise<Buffer> {
   const resolvedTimeout = parseRemoteTimeout(timeoutSeconds);
   return new Promise((resolve, reject) => {
-    client.exec(withRemoteTimeout(command, resolvedTimeout), (error, stream) => {
+    client.exec(remoteCommandLine(command, resolvedTimeout), (error, stream) => {
       if (error) return reject(error);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let locallyTimedOut = false;
       const timer = setTimeout(() => {
         locallyTimedOut = true;
-        stream.close();
+        stopRemoteProcess(stream);
       }, (resolvedTimeout + 8) * 1000);
       const cleanup = () => clearTimeout(timer);
       stream.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -796,11 +810,22 @@ function openAbortableExec(client: SshClient, command: string, signal?: AbortSig
     })), signal);
 }
 
-// Waits for an exec channel to finish. On abort the channel is closed and the call
-// settles immediately: `close()` is only a graceful request, and while a long remote
-// command is still running the "close" event may never arrive, which would leave the
-// tool call (and the caller's stop request) hanging. Remote processes without a pty
-// are not signalled by closing the channel; they stop at their own remote timeout.
+// Asks the remote process to stop, then closes the channel. Closing alone never signals a
+// process that has no pty, so TERM is sent first (SSH "signal" request). Commands are started
+// as `exec timeout ... bash -lc CMD`: the exec makes `timeout` the channel's process, and
+// `timeout` runs the command in its own process group and forwards TERM to the whole group.
+// Limitation: servers older than OpenSSH 7.9 ignore signal requests; the process then keeps
+// running until its own remote timeout, which still bounds it.
+function stopRemoteProcess(stream: ClientChannel): void {
+  try { stream.signal("TERM"); } catch { /* channel may already be gone */ }
+  try { stream.close(); } catch { /* channel may already be gone */ }
+}
+
+// Waits for an exec channel to finish. On abort (or the local safety timer) the remote
+// process is signalled and the channel closed, and the call settles immediately on abort:
+// `close()` is only a graceful request, and while a long remote command is still running
+// the "close" event may never arrive, which would leave the tool call (and the caller's
+// stop request) hanging.
 function runExecChannel(
   stream: ClientChannel,
   timeoutSeconds: number,
@@ -813,7 +838,7 @@ function runExecChannel(
     let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      stream.close();
+      stopRemoteProcess(stream);
     }, (timeoutSeconds + 8) * 1000);
     const settle = (finish: () => void) => {
       if (settled) return;
@@ -825,7 +850,7 @@ function runExecChannel(
       finish();
     };
     const abort = () => {
-      try { stream.close(); } catch { /* channel may already be gone */ }
+      stopRemoteProcess(stream);
       settle(() => reject(abortedError()));
     };
     stream.on("data", onStdout);
@@ -845,9 +870,10 @@ async function execRemoteLimited(
   maxLines: number,
   maxBytes: number,
   signal?: AbortSignal,
+  cwd?: string,
 ): Promise<ReturnType<RemoteExecAccumulator["finish"]>> {
   const resolvedTimeout = parseRemoteTimeout(timeoutSeconds);
-  const stream = await openAbortableExec(client, withRemoteTimeout(command, resolvedTimeout), signal);
+  const stream = await openAbortableExec(client, remoteCommandLine(command, resolvedTimeout, cwd), signal);
   const accumulator = new RemoteExecAccumulator(maxLines, maxBytes);
   let result: { code: number | null; timedOut: boolean };
   try {
@@ -883,6 +909,44 @@ async function withSftp<T>(client: SshClient, operation: (sftp: SFTPWrapper) => 
   const sftp = await getSftp(client);
   try { return await operation(sftp); }
   finally { sftp.end(); }
+}
+
+const sftpCall = <T = void>(start: (done: (error?: Error | null, result?: T) => void) => void): Promise<T> =>
+  new Promise((resolve, reject) => start((error, result) => error ? reject(error) : resolve(result as T)));
+
+// Writes through a temp sibling and renames it over the target, so an interrupted write never leaves a
+// truncated file. Targets that are not regular files, and directories where a temp file cannot be created, are
+// written in place.
+async function writeRemoteFileAtomic(client: SshClient, sftp: SFTPWrapper, target: string, content: string | Buffer): Promise<void> {
+  const writeInPlace = () => sftpCall((done) => sftp.writeFile(target, content, done));
+  let mode: number | undefined;
+  try {
+    const attrs = await sftpCall<any>((done) => sftp.lstat(target, done));
+    if ((attrs.mode & 0o170000) !== 0o100000) return writeInPlace(); // symlink, directory (which must fail), device, ...
+    mode = attrs.mode & 0o7777;
+  } catch { /* new file, or unreadable metadata: the writes below report the real error */ }
+
+  const temp = posix.join(posix.dirname(target), `.${posix.basename(target)}.pi-tmp-${randomBytes(6).toString("hex")}`);
+  // An existing file's mode is copied after the write; until then the temp stays private to the owner.
+  const tempOptions = mode === undefined ? { mode: 0o666 } : { mode: 0o600 };
+  try { await sftpCall((done) => sftp.writeFile(temp, content, tempOptions, done)); }
+  catch (error) {
+    await sftpCall((done) => sftp.unlink(temp, done)).catch(() => {});
+    if ((error as { code?: unknown }).code === 3) return writeInPlace(); // SSH_FX_PERMISSION_DENIED
+    throw error;
+  }
+  try {
+    if (mode !== undefined) await sftpCall((done) => sftp.chmod(temp, mode, done));
+    try { await sftpCall((done) => sftp.ext_openssh_rename(temp, target, done)); }
+    catch (error) {
+      // Only a server without posix-rename@openssh.com falls back to mv; a real rename failure must not.
+      if (!/does not support/i.test((error as Error).message)) throw error;
+      await execRemote(client, `mv -f -- ${quote(temp)} ${quote(target)}`);
+    }
+  } catch (error) {
+    await sftpCall((done) => sftp.unlink(temp, done)).catch(() => {});
+    throw error;
+  }
 }
 
 function isReconnectable(error: unknown): boolean {
@@ -1040,10 +1104,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return undefined;
   };
 
-  const limitRemoteToolResult = (result: any, kind: "read" | "exec", startLine = 1, requestedMaxLines?: number) => {
+  const limitRemoteToolResult = (result: any, kind: "read" | "exec" | "search", startLine = 1, requestedMaxLines?: number) => {
     const limits = configuredOutputLimits();
-    const configuredMaxBytes = kind === "read" ? limits.readMaxBytes : limits.execMaxBytes;
-    const configuredMaxLines = kind === "read" ? limits.readMaxLines : limits.execMaxLines;
+    const configuredMaxBytes = kind === "exec" ? limits.execMaxBytes : limits.readMaxBytes;
+    const configuredMaxLines = kind === "exec" ? limits.execMaxLines : limits.readMaxLines;
     const maxLines = Math.min(configuredMaxLines, requestedMaxLines ?? configuredMaxLines);
     const remaining = Math.max(0, limits.turnMaxBytes - turnOutputBytes);
     if (remaining < MIN_MODEL_OUTPUT_BYTES) {
@@ -1058,15 +1122,17 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const original = result.content[textIndex].text ?? "";
     const reserveBytes = result.details?.modelLimited ? 0 : OUTPUT_FOOTER_RESERVE_BYTES;
     const contentBudget = Math.max(1, maxBytes - reserveBytes);
-    const truncation = kind === "read"
-      ? truncateHead(original, { maxLines, maxBytes: contentBudget })
-      : truncateTail(original, { maxLines, maxBytes: contentBudget });
+    const truncation = kind === "exec"
+      ? truncateTail(original, { maxLines, maxBytes: contentBudget })
+      : truncateHead(original, { maxLines, maxBytes: contentBudget });
     let text = truncation.content;
     let fullOutputPath = result.details?.fullOutputPath as string | undefined;
     if (truncation.firstLineExceedsLimit) {
       text = `[Line ${startLine} exceeds the ${formatSize(maxBytes)} remote read limit. Use bash with sed/head -c to inspect a bounded fragment.]`;
     } else if (truncation.truncated) {
-      if (kind === "read") {
+      if (kind === "search") {
+        text += `\n\n[Showing first ${truncation.outputLines} lines (${formatSize(maxBytes)} remote output limit). Narrow the pattern or path.]`;
+      } else if (kind === "read") {
         const nextOffset = startLine + truncation.outputLines;
         text += `\n\n[Showing ${truncation.outputLines} lines (${formatSize(maxBytes)} remote read limit). Use offset=${nextOffset} to continue.]`;
       } else {
@@ -1470,8 +1536,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   };
 
   const remoteWriteOps = (): WriteOperations => ({
-    writeFile: (path, content) => withReconnect((client) => withSftp(client, (sftp) =>
-      new Promise<void>((resolve, reject) => sftp.writeFile(mapPath(path), content, (error) => error ? reject(error) : resolve())))),
+    writeFile: (path, content) => withReconnect((client) => withSftp(client, (sftp) => writeRemoteFileAtomic(client, sftp, mapPath(path), content))),
     mkdir: async (path) => { await withReconnect((client) => execRemote(client, `mkdir -p -- ${quote(mapPath(path))}`)); },
   });
 
@@ -1484,8 +1549,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const remoteBashOps = (): BashOperations => ({
     exec: async (command, cwd, { onData, signal, timeout }) => {
       const timeoutSeconds = parseRemoteTimeout(timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
-      const remoteCommand = withRemoteTimeout(command, timeoutSeconds);
-      const full = `cd -- ${quote(mapPath(cwd))} && ${remoteCommand}`;
+      const full = remoteCommandLine(command, timeoutSeconds, mapPath(cwd));
       const stream = await withReconnect((client) => openAbortableExec(client, full, signal), signal);
       const { code, timedOut } = await runExecChannel(stream, timeoutSeconds, onData, onData, signal);
       if (timedOut || code === 124 || code === 137) throw new Error(`timeout:${timeoutSeconds}`);
@@ -1493,10 +1557,128 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     },
   });
 
+  const isDirectoryMode = (mode: number): boolean => (mode & 0o170000) === 0o040000;
+  const sftpStat = (sftp: SFTPWrapper, path: string) => sftpCall<any>((done) => sftp.stat(path, done));
+  // A missing path is an answer; any other failure (for example a dropped connection) must surface.
+  const missingAsFalse = (error: any): false => {
+    if (error?.code === 2) return false;
+    throw error;
+  };
+
+  // One SFTP session per ls call. readdir remembers each entry's type, so the built-in's per-entry stat
+  // is answered from memory; symlinks are not remembered because the built-in follows them with stat.
+  const executeRemoteLs = async (id: string, params: any, signal: AbortSignal | undefined, update: any, ctx: any) => {
+    const result = await withReconnect((client) => withSftp(client, async (sftp) => {
+      const isDirectoryByPath = new Map<string, boolean>();
+      const operations: LsOperations = {
+        exists: (path) => sftpStat(sftp, mapPath(path)).then(() => true, missingAsFalse),
+        stat: async (path) => {
+          const known = isDirectoryByPath.get(path);
+          if (known !== undefined) return { isDirectory: () => known };
+          const attrs = await sftpStat(sftp, mapPath(path));
+          return { isDirectory: () => isDirectoryMode(attrs.mode) };
+        },
+        readdir: async (path) => {
+          const entries = await sftpCall<any[]>((done) => sftp.readdir(mapPath(path), done));
+          const names: string[] = [];
+          for (const entry of entries) {
+            if (entry.filename === "." || entry.filename === "..") continue;
+            names.push(entry.filename);
+            if ((entry.attrs.mode & 0o170000) !== 0o120000) isDirectoryByPath.set(join(path, entry.filename), isDirectoryMode(entry.attrs.mode));
+          }
+          return names;
+        },
+      };
+      return withContext(createLsTool(localCwd, { operations })).execute(id, params, signal, update, remoteToolContext(ctx));
+    }), signal);
+    return limitRemoteToolResult(result, "search");
+  };
+
+  // Runs a shell script in `cwd` on one exec channel and returns its stdout; abort signals the remote process.
+  const captureRemoteScript = async (script: string, cwd: string, signal?: AbortSignal): Promise<string> => {
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const { code, timedOut } = await withReconnect(async (client) => {
+      stdout.length = 0;
+      stderr.length = 0;
+      const stream = await openAbortableExec(client, remoteCommandLine(script, REMOTE_SEARCH_TIMEOUT_SECONDS, cwd), signal);
+      return runExecChannel(stream, REMOTE_SEARCH_TIMEOUT_SECONDS, (chunk) => stdout.push(chunk), (chunk) => stderr.push(chunk), signal);
+    }, signal);
+    if (timedOut || code === 124 || code === 137) throw new Error(`Remote search timed out after ${REMOTE_SEARCH_TIMEOUT_SECONDS} seconds`);
+    const text = Buffer.concat(stdout).toString("utf8");
+    if (code !== 0 && !text.trim()) throw new Error(Buffer.concat(stderr).toString().trim() || `Remote search exited with code ${code}`);
+    return text;
+  };
+
+  const executeRemoteFind = async (id: string, params: any, signal: AbortSignal | undefined, update: any, ctx: any) => {
+    const operations: FindOperations = {
+      exists: (path) => withReconnect((client) => withSftp(client, (sftp) => sftpStat(sftp, mapPath(path))), signal).then(() => true, missingAsFalse),
+      glob: async (pattern, cwd, { limit }) => {
+        const dir = mapPath(cwd);
+        return parseFindOutput(await captureRemoteScript(buildFindScript(pattern, dir, limit), dir, signal), dir);
+      },
+    };
+    const result = await withContext(createFindTool(localCwd, { operations })).execute(id, params, signal, update, remoteToolContext(ctx));
+    return limitRemoteToolResult(result, "search");
+  };
+
+  // The built-in grep cannot be redirected through its operations, so this reproduces its output format
+  // from a remote ripgrep (or GNU grep when rg is missing) streamed over one exec channel. The remote
+  // process is stopped as soon as the match limit and its trailing context are satisfied.
+  const executeRemoteGrep = async (_id: string, params: any, signal: AbortSignal | undefined) => {
+    if (signal?.aborted) throw abortedError();
+    const searchPath = remotePath(params.path || ".");
+    let isDirectory: boolean;
+    try {
+      isDirectory = isDirectoryMode((await withReconnect((client) => withSftp(client, (sftp) => sftpStat(sftp, searchPath)), signal)).mode);
+    } catch (error) {
+      if ((error as any)?.code === 2) throw new Error(`Path not found: ${searchPath}`);
+      throw error;
+    }
+    const { limit, context } = grepLimits(params);
+    const script = buildGrepScript(params, isDirectory ? "." : posix.basename(searchPath));
+    const cwd = isDirectory ? searchPath : posix.dirname(searchPath);
+
+    let collector!: GrepCollector;
+    let stderr = "";
+    let stoppedEarly = false;
+    const { code, timedOut } = await withReconnect(async (client) => {
+      collector = new GrepCollector(limit, context, isDirectory);
+      stderr = "";
+      stoppedEarly = false;
+      const splitter = new LineSplitter();
+      const early = new AbortController();
+      const stop = signal ? AbortSignal.any([signal, early.signal]) : early.signal;
+      const feed = (lines: string[]) => {
+        for (const line of lines) {
+          if (collector.addLine(line)) { stoppedEarly = true; early.abort(); return; }
+        }
+      };
+      const stream = await openAbortableExec(client, remoteCommandLine(script, REMOTE_SEARCH_TIMEOUT_SECONDS, cwd), stop);
+      try {
+        const result = await runExecChannel(stream, REMOTE_SEARCH_TIMEOUT_SECONDS, (chunk) => { if (!stoppedEarly) feed(splitter.push(chunk)); },
+          (chunk) => { if (stderr.length < 16384) stderr += chunk.toString(); }, stop);
+        feed(splitter.flush());
+        return result;
+      } catch (error) {
+        if (stoppedEarly && !signal?.aborted) return { code: 0, timedOut: false };
+        throw error;
+      }
+    }, signal);
+    if (timedOut || code === 124 || code === 137) throw new Error(`Remote search timed out after ${REMOTE_SEARCH_TIMEOUT_SECONDS} seconds`);
+    // rg and grep exit 1 for "no matches" and 2 for partial errors (for example unreadable directories).
+    if (code !== 0 && code !== 1 && !(code === 2 && collector.matchCount > 0)) throw new Error(stderr.trim() || `Remote search exited with code ${code}`);
+    const { text, details } = collector.finish();
+    return limitRemoteToolResult({ content: [{ type: "text", text }], details }, "search");
+  };
+
   const localRead = withContext(createReadTool(localCwd));
   const localWrite = withContext(createWriteTool(localCwd));
   const localEdit = withContext(createEditTool(localCwd));
   let localBash = withContext(createBashTool(localCwd));
+  const localGrep = withContext(createGrepTool(localCwd));
+  const localFind = withContext(createFindTool(localCwd));
+  const localLs = withContext(createLsTool(localCwd));
   const targetsLocalServerMemory = (path: unknown): boolean => {
     if (!remote || typeof path !== "string") return false;
     return resolve(path.replace(/^@/, "")) === serverMemoryFilePath(remote);
@@ -1522,6 +1704,33 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     execute: (id, params, signal, update, ctx) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
       ? withContext(createEditTool(localCwd, { operations: remoteEditOps() })).execute(id, params, signal, update, remoteToolContext(ctx))
       : localEdit.execute(id, params, signal, update, ctx),
+  });
+  pi.registerTool({
+    ...localGrep,
+    // Like the built-in, active only when enabled (defaultTools / --tools), not on registration.
+    defaultActive: false,
+    description: `${localGrep.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update, ctx) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? executeRemoteGrep(id, params, signal)
+      : localGrep.execute(id, params, signal, update, ctx),
+  });
+  pi.registerTool({
+    ...localFind,
+    // Like the built-in, active only when enabled (defaultTools / --tools), not on registration.
+    defaultActive: false,
+    description: `${localFind.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update, ctx) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? executeRemoteFind(id, params, signal, update, ctx)
+      : localFind.execute(id, params, signal, update, ctx),
+  });
+  pi.registerTool({
+    ...localLs,
+    // Like the built-in, active only when enabled (defaultTools / --tools), not on registration.
+    defaultActive: false,
+    description: `${localLs.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update, ctx) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? executeRemoteLs(id, params, signal, update, ctx)
+      : localLs.execute(id, params, signal, update, ctx),
   });
   pi.registerTool({
     ...localBash,
@@ -1642,11 +1851,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const limits = configuredOutputLimits();
         const formatted = await withReconnect((client) => execRemoteLimited(
           client,
-          `cd -- ${quote(params.cwd ?? state.cwd)} && ${params.remoteCommand}`,
+          params.remoteCommand,
           timeoutSeconds,
           limits.execMaxLines,
           limits.execMaxBytes,
           signal,
+          params.cwd ?? state.cwd,
         ), signal);
         return limitRemoteToolResult({
           content: [{ type: "text", text: formatted.text }],
@@ -1851,10 +2061,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           const limits = configuredOutputLimits();
           const formatted = await withReconnect((client) => execRemoteLimited(
             client,
-            `cd -- ${quote(state.cwd)} && ${execInput}`,
+            execInput,
             timeoutSeconds,
             limits.execMaxLines,
             limits.execMaxBytes,
+            undefined,
+            state.cwd,
           ));
           const preview = previewRemoteOutput(formatted.content, displayLines);
           const omitted = formatted.truncation.totalLines > displayLines
