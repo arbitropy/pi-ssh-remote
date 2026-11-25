@@ -10,17 +10,16 @@ pi-ssh-remote 中文说明文档，重点介绍它面向 Pi Agent 的设计、�
 
 `pi-ssh-remote` 是一个专门面向 Pi Agent 的 SSH 远程开发插件。
 
-它不只是帮你打开一个远程终端。连接服务器后，Pi 原有的 `read`、`write`、`edit`、`bash` 等工具会自动切换到远端。Agent 不需要反复拼接 SSH 命令，也不需要先把代码下载到本地再修改，可以直接在服务器上查看文件、分析日志、修改代码和运行任务。
+它维护一份全局的**远程项目**目录，并让 Pi 把「焦点」放在其中一个项目上。焦点在某个远程项目时，Pi 原有的 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 等工具会自动在该服务器上执行。Agent 不需要反复拼接 SSH 命令，也不需要先把代码下载到本地再修改，可以直接在服务器上查看文件、分析日志、修改代码和运行任务。
 
 例如，你可以直接对 Pi 说：
 
 ```text
-连接 ssh root@gpu-box -p 2202，进入 /srv/training。
-检查最近一次训练为什么失败，修复问题后在后台重新启动，
-最后把 PID 和日志路径发给我。
+连接 befaq-prod，检查最近一次部署为什么失败，
+在服务器上修复后告诉我改了什么。
 ```
 
-Pi 会依次完成连接服务器、切换目录、读取日志、修改文件和启动任务。整个过程中，它使用的仍然是熟悉的 Pi 工具，只是执行位置变成了远程服务器。
+Pi 会先 `remote list` 找到项目，再 `remote connect befaq-prod`，然后读取日志、修改文件并运行测试。整个过程中，它使用的仍然是熟悉的 Pi 工具，只是执行位置变成了远程服务器。
 
 ## 为什么它更适合 Agent
 
@@ -36,29 +35,25 @@ ssh user@host "cd /path && ..."
 
 ### Agent 知道自己正在操作哪台服务器
 
-插件会把当前远程目录和服务器信息写入 Pi 的上下文，并显示在底部状态栏：
+插件会把当前焦点、本会话的远程项目及其目录写入 Pi 的上下文，并显示在底部状态栏：
 
 ```text
-H100 训练机 (root@gpu-box.example.com:2202):/srv/project
+gpu-box:/srv/project  ● befaq-prod  ○ staging
 ```
 
 这样无论是用户还是 Agent，都能随时确认当前操作发生在本地还是远端，减少误操作。
 
-### 服务器配置会保留
+### 命名的远程项目，所有会话共享
 
-每台服务器都可以单独保存：
+远程项目由名称、SSH 命令和工作目录组成，例如 `befaq-prod` = `ssh befaq-prod`，目录 `/opt/wifaq-production`，还可以附带备注、guard 标记、本地目录和端口转发。项目是全局的，与 Pi 启动时所在的本地文件夹无关，每个会话都能看到。Agent 通过 `remote list` 找到项目并按精确名称连接；你可以用 `/remote add`、`/remote edit`、`/remote remove` 管理它们。
 
-- SSH 地址；
-- 默认工作目录；
-- 服务器备注；
-- 服务器特定记忆；
-- 端口转发配置。
+### 焦点决定工具在哪里执行
 
-例如可以把几台机器分别备注为 `8xH100 训练机`、`预发布环境`、`线上只读机`。这些配置保存在本地，重启 Pi 后仍然存在。
+每个会话记录自己用过的项目列表和一个**焦点**：`local` 或其中某个项目。焦点在远程项目时，Pi 的文件工具、Shell 工具和 `!` 用户命令都会通过 SSH 透明执行。切换是显式的（`/remote focus NAME|local`），Agent 可以在两台服务器之间对比，或回到本地代码库，而不用重新连接。如果焦点项目断线且无法重连，被路由的工具会返回明确的错误，绝不会悄悄回退到本地执行。
 
 ### 断线后可以自动恢复
 
-当前会话中如果 SSH 连接意外断开，插件会尝试自动重连，不需要 Agent 从头建立工作环境。SSH 工作区状态也会跟随 Pi session：`/new` 继承当前工作区，`/fork` 和 `/clone` 保留来源工作区，`/resume` 恢复目标历史 session 记录的服务器、远程目录、路由模式和端口转发。
+同一主机上的项目共享一条 SSH 连接；只要还有已连接项目在使用，连接意外断开时插件就会自动重连。会话会记住自己的项目列表：`/resume` 会把所有项目恢复为未连接状态并把焦点放回 local（不会自动连接）；`/reload`、`/new` 和 fork 则会在交互式 TUI 中重新连接之前已连接的项目。
 
 ### 对 Agent 上下文更友好
 
@@ -66,7 +61,7 @@ H100 训练机 (root@gpu-box.example.com:2202):/srv/project
 
 ### 可以远端跑服务、本地改代码
 
-端口转发模式下，可以把远端服务映射到 `localhost`，同时让 Pi 的文件和 Shell 工具继续操作本地项目。
+端口转发绑定在项目的连接上，不会改变焦点。因此可以把远端服务映射到 `localhost`，同时把焦点放回 local，让 Pi 的文件和 Shell 工具继续操作本地项目。
 
 这很适合下面这类场景：
 
@@ -96,55 +91,52 @@ pi install npm:pi-ssh-remote
 
 ## 快速开始
 
-连接服务器：
+保存并连接一个项目：
 
 ```text
-/remote ssh root@gpu-box.example.com -p 2202
-```
-
-设置远程工作目录和备注：
-
-```text
-/remote cd /srv/project
-/remote config note H100 训练机
-```
-
-查看当前状态：
-
-```text
+/remote add gpu-box "ssh -p 2202 root@gpu-box.example.com" /srv/project H100 训练机
+/remote connect gpu-box
+/remote cd /srv/train
 /remote status
 ```
 
-连接成功后，Pi 的文件和 Shell 工具都会操作远程 `/srv/project`。
-
-需要返回本地时执行：
+`/remote add NAME SSH CWD [备注...]` 保存项目（SSH 部分可以是带引号的完整命令，也可以只写 `tanim@islam30902` 这样的目标或 `~/.ssh/config` 里的别名）。`/remote connect gpu-box` 连接并聚焦该项目。此后 Pi 的文件和 Shell 工具都会操作远程服务器。底部状态栏先显示焦点，再显示本会话用过的其他项目（`●` 已连接，`○` 未连接）：
 
 ```text
-/remote disconnect
+gpu-box:/srv/train  ● befaq-prod  ○ staging
 ```
 
-### 服务器记忆
-
-直接告诉 Pi 要为当前服务器记住什么：
+切回本地或切换到其他项目：
 
 ```text
-记住这台服务器使用 /opt/conda/bin/python，不要停止共享任务。
+/remote focus local
+/remote focus befaq-prod
+```
+
+`/remote ssh root@host -p 22` 是快捷方式：查找或创建对应的项目（以别名或 `user-host` 命名，目录为 `~`）并连接。
+
+### 项目记忆
+
+直接告诉 Pi 要为当前聚焦的项目记住什么：
+
+```text
+记住这个项目使用 /opt/conda/bin/python，不要停止共享任务。
 ```
 
 查看已有记忆和 ID：
 
 ```text
-/remote memory
+/remote memory [NAME]
 ```
 
-通过 ID 修改或删除：
+每个项目的记忆保存在 `~/.pi/agent/ssh-remote-memories/projects/NAME.json`。Pi 只会应用当前聚焦的远程项目的记忆，并用本地工具编辑该文件。通过 ID 修改或删除：
 
 ```text
 把记忆 deploy-command 改为使用 /opt/deploy/v2/run.sh。
 删除记忆 obsolete-proxy-rule。
 ```
 
-以后连接这台服务器时，Pi 会自动使用这些记忆。只有明确要求删除时才会删除。
+只有明确要求删除时才会删除。删除项目时其记忆文件会保留。
 
 ### 使用私钥文件登录
 
@@ -181,59 +173,40 @@ pi install npm:pi-ssh-remote
 
 ### 3. 管理多台服务器
 
-先配置训练机：
-
 ```text
-/remote ssh root@10.0.0.21 -p 22
-/remote config note 8xH100 训练机
-/remote config cwd /srv/train
+/remote add train "ssh root@10.0.0.21" /srv/train 8xH100 训练机
+/remote add staging "ssh -p 2222 ubuntu@staging.example.com" /opt/service 预发布 API
+/remote edit staging guard=readonly local=/home/me/service
+/remote list
+/remote connect train
+/remote connect staging
+/remote focus train
 ```
 
-再配置预发布服务器：
-
-```text
-/remote ssh ubuntu@staging.example.com -p 2222
-/remote config note 预发布 API
-/remote config cwd /opt/service
-```
-
-查看并切换服务器：
-
-```text
-/remote config
-/remote use root@10.0.0.21:22
-/remote
-```
-
-备注和默认目录会按 `user@host:port` 分别保存，不会互相覆盖。
+项目全局保存，所有会话都能看到。两台服务器可以同时保持连接，用 `/remote focus` 在它们之间切换工具的执行位置。
 
 ### 4. 远端启动模型，本地开发界面
 
-保存并启动端口转发：
-
 ```text
-/remote config forward 7860:127.0.0.1:7860
+/remote edit train forwards="7860:127.0.0.1:7860"
+/remote connect train
 /remote forward
+/remote focus local
 ```
 
-现在访问本地 `localhost:7860`，实际连接的是远程服务器上的 7860 端口；与此同时，Pi 的文件和 Shell 工具会留在本地，方便继续修改前端或客户端代码。
-
-停止转发：
-
-```text
-/remote unforward
-```
+`/remote forward` 启动当前聚焦项目已保存的 `forwards`（或你传入的映射）。端口转发属于项目的连接，不会改变焦点，所以执行 `/remote focus local` 之后，访问本地 `localhost:7860` 仍然连接的是远程服务器上的 7860 端口，同时 Pi 的文件和 Shell 工具操作本地项目。断开该项目或执行 `/remote unforward` 即可停止转发。
 
 ### 5. 直接用自然语言操作
 
 不想记命令时，可以直接告诉 Pi：
 
 ```text
-连接已配置的远程服务器，进入 /srv/api，然后检查 Git 状态。
+连接 staging 项目，进入 /srv/api，然后检查 Git 状态。
 ```
 
 ```text
-把当前服务器备注为“线上只读机”，然后告诉我现在操作的是哪台服务器。
+保存一个名为 prod-readonly 的项目：ssh deploy@prod.example.com，目录 /srv/api，
+备注“线上只读”，然后聚焦到它。
 ```
 
 ```text
@@ -244,54 +217,67 @@ pi install npm:pi-ssh-remote
 
 | 命令 | 作用 |
 |---|---|
-| `/remote ssh USER@HOST -p PORT [-i KEY]` | 保存并使用 SSH 配置、Agent、私钥或密码连接服务器 |
-| `/remote` | 连接当前选中的服务器，或提示输入 SSH 地址 |
-| `/remote config` | 查看已保存的服务器和配置 |
-| `/remote use USER@HOST:PORT` | 切换到指定服务器 |
-| `/remote config note TEXT` | 给当前服务器添加或修改备注 |
-| `/remote config note --clear` | 清除当前服务器备注 |
-| `/remote memory` | 展示当前服务器的记忆条目和 ID |
-| `/remote config cwd PATH` | 设置默认远程工作目录 |
-| `/remote cd PATH` | 切换当前远程目录并保存 |
-| `/remote config forward MAPPING...` | 保存端口转发配置，例如 `7860:127.0.0.1:7860` |
-| `/remote forward [MAPPING...]` | 启动端口转发，并让 Pi 工具留在本地 |
-| `/remote unforward` | 停止插件创建的端口转发 |
-| `/remote exec COMMAND` | 在当前远程目录执行一次命令 |
-| `/remote exec --timeout 60 COMMAND` | 单独设置本次命令的超时时间 |
-| `/remote exec --lines 20 COMMAND` | 单独设置本次折叠显示的行数 |
+| `/remote` / `/remote list` | 以可复制的文本列出已保存项目（名称、ssh、目录、状态、备注）和当前焦点 |
+| `/remote add NAME SSH CWD [备注...]` | 保存项目；SSH 可用带引号的完整命令或裸目标 |
+| `/remote edit NAME key=value...` | 修改 `ssh`、`cwd`、`note`、`guard`、`local`、`forwards`；`key=` 清除可选字段 |
+| `/remote remove NAME` | 删除已保存项目（保留其记忆文件） |
+| `/remote connect NAME` | 连接项目（精确名称）并聚焦 |
+| `/remote focus NAME\|local` | 把工具切到某个会话项目或回到本地；未连接的会话项目会被重新连接 |
+| `/remote disconnect [NAME]` | 断开项目（默认当前焦点）；若它有焦点则焦点回到 local |
+| `/remote status` | 查看焦点和本会话的项目 |
+| `/remote memory [NAME]` | 展示项目的记忆条目、ID 和文件 |
+| `/remote cd PATH` | 修改当前聚焦项目在本会话中的工作目录 |
+| `/remote exec [--timeout S] [--lines N] COMMAND` | 在当前聚焦项目中执行一次命令 |
+| `/remote forward [MAPPING...]` | 为当前聚焦项目启动端口转发（默认使用其已保存的 `forwards`） |
+| `/remote unforward` | 停止插件创建的端口转发（当前聚焦项目的；焦点为 local 时停止全部） |
+| `/remote forget [NAME]` | 断开连接并清除该项目各跳的内存密码和密钥 passphrase |
+| `/remote ssh ARGS...` | 快捷方式：查找或创建 `ssh ARGS...` 对应的项目（目录 `~`）并连接 |
+| `/remote config` | 查看输出限制、预览行数和配置文件路径 |
 | `/remote config display-lines 10` | 设置默认折叠显示行数（最大 50） |
-| `/remote config read-max-lines 400` | 设置远端读取行数预算 |
-| `/remote config read-max-bytes 16384` | 设置远端读取字节预算 |
-| `/remote config exec-max-lines 200` | 设置远端命令行数预算 |
-| `/remote config exec-max-bytes 8192` | 设置远端命令字节预算 |
+| `/remote config read-max-lines 400` / `read-max-bytes 16384` | 设置远端读取预算 |
+| `/remote config exec-max-lines 200` / `exec-max-bytes 8192` | 设置远端命令输出预算 |
 | `/remote config turn-max-bytes 32768` | 设置每轮远端工具总输出预算 |
-| `/remote status` | 查看连接状态、完整 SSH 命令和工作目录 |
-| `/remote reload` / `/remote reconnect` | 恢复保存的工作区，支持断开后重连 |
-| `/remote disconnect` | 断开连接并返回本地 |
-| `/remote forget` | 断开连接并清除内存中的密码和密钥 passphrase |
+
+项目名称使用小写字母、数字、`.`、`_`、`-`（最长 64 个字符，以字母或数字开头），`local` 为保留名。`guard`（`readonly` 或 `confirm`）和 `local`（本地目录）只会被记录并展示给 Agent 和列表，强制执行 guard 将在后续版本提供。
+
+### `remote` 工具
+
+Agent 使用一个工具，包含这些 action：`list`、`add`、`edit`、`remove`、`connect`、`disconnect`、`focus`、`status`、`chdir`、`memory`、`forward`、`unforward`、`exec`、`forget`。`connect` 需要精确的项目名称，名称不存在时会返回几个相近的已保存项目。`remove` 只用于用户明确提出的请求。密码和密钥 passphrase 绝不会作为参数接收。
+
+### 斜杠命令补全
+
+`/remote` 支持 Pi 参数补全：输入 `/remote sta` 可补全 `status`，输入 `/remote connect ` 可从已保存的项目名中选择。
 
 ## 配置保存在哪里
 
-服务器配置保存在本地：
+远程项目保存在本地：
 
 ```text
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-全局配置包括：
+```json
+{
+  "version": 2,
+  "projects": {
+    "befaq-prod": {
+      "ssh": "ssh befaq-prod",
+      "cwd": "/opt/wifaq-production",
+      "note": "线上",
+      "guard": "readonly",
+      "local": "/home/me/wifaqdrf",
+      "forwards": ["8080:127.0.0.1:80"]
+    }
+  },
+  "displayLines": 5
+}
+```
 
-- 已保存的服务器；
-- 当前选中的服务器；
-- 服务器备注；
-- 默认远程目录；
-- 端口转发配置；
-- 私钥文件路径；
-- 命令预览设置；
-- 模型输出预算。
-
-此外，每个 Pi session 都会记录不含凭据的 SSH 工作区元数据，用于在 `/resume` 时恢复该历史 session 对应的服务器环境。
+`ssh` 和 `cwd` 必填（`cwd` 可以是 `~`），其余项目字段可选。同一文件还保存命令预览设置和模型输出预算。此外，每个 Pi session 会记录不含凭据的元数据（焦点和本会话的项目及其当前目录），用于 `/resume` 时列出这些项目；它不会自动重新连接。
 
 私钥内容、密码和密钥 passphrase 都不会写入配置文件。插件仅在连接时从本地读取私钥；手动输入的密码和 passphrase 只会缓存在当前 Pi 进程的内存中。
+
+**从 0.1.x 升级：** 首次启动时，旧的基于 endpoint 的文件会被重写为上述结构。原文件会复制为 `ssh-remote-config.v1.backup.json`（仅在该备份不存在时），每个 endpoint 变成一个项目，名称取自 ssh 别名（`ssh befaq-prod` 变为 `befaq-prod`）或 `user-host`，当前 endpoint 的概念被移除；按主机保存的记忆会复制到 `ssh-remote-memories/projects/NAME.json`（旧文件保留）。无法解析的文件绝不会被覆盖。
 
 ## 安全与输出限制
 

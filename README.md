@@ -8,38 +8,37 @@ Agent-first English documentation for pi-ssh-remote. It explains the extension's
 
 [中文文档](README.zh-CN.md) · [Community](https://linux.do/)
 
-`pi-ssh-remote` turns a remote machine into Pi's active workspace. After connecting, the agent keeps using its normal `read`, `write`, `edit`, and `bash` tools, but those operations run on the remote server. There is no need to wrap every action in `ssh ...`, copy files back and forth, or make the model reason about two unrelated shells.
+`pi-ssh-remote` keeps a catalog of named **remote projects** and lets Pi focus on one. While a remote project has the focus, the agent keeps using its normal `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` tools, but they run on that server. There is no need to wrap every action in `ssh ...`, copy files back and forth, or make the model reason about two unrelated shells.
 
 ```text
-You: Connect to ssh root@gpu-box -p 2202, open /srv/training,
-     find why the latest run failed, fix it, and restart it in the
-     background. Return the PID and log path.
+You: Connect to befaq-prod, find why the latest deploy failed, fix it on
+     the server, and tell me what you changed.
 
-Pi:  connects → changes the persistent remote cwd → reads logs →
-     edits remote files → launches the job on the GPU server
+Pi:  remote connect befaq-prod → reads logs → edits remote files →
+     runs the tests on the server
 ```
 
 ## Designed for agent workflows
 
-### The remote machine becomes the agent's workspace
+### Named remote projects, shared by every session
 
-Once connected, Pi's file tools, shell tool, and `!` user shell commands are transparently routed over SSH. The agent can inspect a repository, search logs, edit code, and run tests with the same tool interface it uses locally.
+A remote project is a name plus an SSH command and a working directory, for example `befaq-prod` = `ssh befaq-prod` in `/opt/wifaq-production`, with an optional note, guard label, local checkout path, and port forwards. Projects are global: they are not tied to the folder Pi runs in, and they appear in every session. The agent finds them with `remote list` and connects by exact name; you manage them with `/remote add`, `/remote edit`, and `/remote remove`.
+
+### Focus decides where tools run
+
+Each session keeps an ordered list of the projects it has used and a **focus**: `local` or one of those projects. While a remote project has the focus, Pi's file tools, shell tool, and `!` user shell commands are transparently routed over SSH. Switching is explicit (`/remote focus NAME|local`), so the agent can compare two servers or hop back to the local checkout without reconnecting. If the focused project loses its connection and cannot reconnect, routed tools fail with a clear error; they never silently fall back to the local machine.
 
 ### Agent control plane, human control plane
 
-The extension exposes `remote` for the agent and `/remote` for the user. You can ask Pi to connect, inspect status, change directory, add a server note, execute a command, create a tunnel, or return to local work in natural language—and still take direct control whenever you want.
-
-### Stateful endpoints instead of disposable SSH commands
-
-Each `user@host:port` endpoint remembers its remote working directory, note, and port-forward configuration locally. Notes such as `H100 training`, `staging`, or `customer demo` appear in configuration, status messages, and Pi's footer, so the active execution environment stays visible.
+The extension exposes `remote` for the agent and `/remote` for the user. You can ask Pi to connect, switch focus, change directory, run a command, create a tunnel, or return to local work in natural language, and still take direct control whenever you want.
 
 ### Resilient and bounded by default
 
-Dropped connections are automatically re-established during the active session. SSH workspace state is also session-aware: `/new` inherits the current workspace, forks and clones retain their source workspace, and `/resume` restores the selected session's recorded endpoint, remote directory, routing mode, and forwards. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
+Projects on the same host share one SSH connection. A dropped connection is re-established automatically while any connected project uses it. Sessions remember their project list: `/resume` restores it with every project disconnected and the focus on local (it never connects on its own), while `/reload`, `/new`, and forks reconnect the projects that were connected in the interactive TUI. Remote commands have a 30-second default timeout. Remote text reads fetch focused ranges instead of downloading complete files, command output is streamed through bounded buffers, and a 32 KB per-turn budget prevents parallel tools from flooding model context. Complete oversized command output is preserved in a permission-restricted temporary file.
 
 ### Hybrid local/remote workflows
 
-Tunnel mode forwards remote services to localhost while returning Pi's tools to the local machine. This is useful when the backend runs on a GPU server but the client, browser automation, or integration code lives locally.
+Port forwards attach to a project's connection without changing the focus. This is useful when the backend runs on a GPU server but the client, browser automation, or integration code lives locally.
 
 ## Why not just run `ssh` in Bash?
 
@@ -63,46 +62,49 @@ Requires Node.js 20+. The remote server must provide Bash, SFTP, and GNU `timeou
 ## Quick start
 
 ```text
-/remote ssh root@gpu-box.example.com -p 2202
-/remote cd /srv/project
-/remote config note H100 training server
+/remote add gpu-box "ssh -p 2202 root@gpu-box.example.com" /srv/project H100 training server
+/remote connect gpu-box
+/remote cd /srv/train
 /remote status
 ```
 
-From this point, normal Pi operations target `/srv/project` on the remote server. The footer makes that routing explicit:
+`/remote add NAME SSH CWD [NOTE...]` saves a project (quote a full ssh command, or pass a bare target such as `tanim@islam30902` or an `~/.ssh/config` alias). `/remote connect gpu-box` connects and focuses it. From this point, normal Pi operations target the remote server. The footer shows the focus first, then other projects used in the session (`●` connected, `○` disconnected):
 
 ```text
-H100 training server (root@gpu-box.example.com:2202):/srv/project
+gpu-box:/srv/train  ● befaq-prod  ○ staging
 ```
 
-Return to local tools with:
+Switch tools back to this machine, or to another project, with:
 
 ```text
-/remote disconnect
+/remote focus local
+/remote focus befaq-prod
 ```
 
-### Server memory
+`/remote ssh root@host -p 22` is a quick path: it finds or creates a project for that command (named after the alias or `user-host`, with cwd `~`) and connects.
 
-Tell Pi what to remember for the current server:
+### Project memory
+
+Tell Pi what to remember for the focused project:
 
 ```text
-Remember for this server: use /opt/conda/bin/python and never stop shared jobs.
+Remember for this project: use /opt/conda/bin/python and never stop shared jobs.
 ```
 
 List saved entries and their IDs:
 
 ```text
-/remote memory
+/remote memory [NAME]
 ```
 
-Use an ID to update or delete an entry:
+Each project has its own file at `~/.pi/agent/ssh-remote-memories/projects/NAME.json`. Pi applies the memory of the focused remote project only, and edits that file with its normal local tools. Use an ID to update or delete an entry:
 
 ```text
 Update memory deploy-command to use /opt/deploy/v2/run.sh.
 Delete memory obsolete-proxy-rule.
 ```
 
-Pi automatically applies saved memory when you work on that server. Deletion only happens when you explicitly request it.
+Deletion only happens when you explicitly request it. Removing a project keeps its memory file.
 
 ### Private key authentication
 
@@ -133,17 +135,17 @@ Reconnects rebuild the same route. Disconnect closes the whole chain; `/remote f
 ### 1. Let the agent investigate and repair a remote failure
 
 ```text
-Connect to ssh ubuntu@training.example.com -p 22 and work in /opt/app.
-Inspect the failed deployment, trace the error through the logs and source,
-make the smallest safe fix, run the relevant tests, and show me the diff.
+Connect to befaq-prod and work in /opt/app. Inspect the failed deployment,
+trace the error through the logs and source, make the smallest safe fix,
+run the relevant tests, and show me the diff.
 ```
 
-The connection is established once. Subsequent reads, searches, edits, and tests are ordinary Pi tool calls routed to the server.
+The agent calls `remote list`, then `remote connect befaq-prod`. Subsequent reads, searches, edits, and tests are ordinary Pi tool calls routed to the server.
 
 ### 2. Launch a long GPU job without blocking the agent
 
 ```text
-On the current remote server, validate the training command first. Then launch
+On the focused remote project, validate the training command first. Then launch
 it with nohup in the background, redirect stdout and stderr from process start,
 and report the PID, output directory, and log path. Verify that the process is
 still alive and that the log has started.
@@ -154,45 +156,37 @@ The default foreground timeout prevents an accidental long-running command from 
 ### 3. Keep several machines understandable
 
 ```text
-/remote ssh root@10.0.0.21 -p 22
-/remote config note 8xH100 training
-/remote config cwd /srv/train
-
-/remote ssh ubuntu@staging.example.com -p 2222
-/remote config note staging API
-/remote config cwd /opt/service
-
-/remote config
-/remote use root@10.0.0.21:22
-/remote
+/remote add train "ssh root@10.0.0.21" /srv/train 8xH100 training
+/remote add staging "ssh -p 2222 ubuntu@staging.example.com" /opt/service staging API
+/remote edit staging guard=readonly local=/home/me/service
+/remote list
+/remote connect train
+/remote connect staging
+/remote focus train
 ```
 
-Endpoint notes and working directories survive Pi restarts and remain separate for each saved endpoint.
+Projects are saved globally, so every session sees them. Both stay connected; `/remote focus` moves the tools between them.
 
 ### 4. Expose a remote service while editing locally
 
 ```text
-/remote config forward 7860:127.0.0.1:7860
+/remote edit train forwards="7860:127.0.0.1:7860"
+/remote connect train
 /remote forward
+/remote focus local
 ```
 
-Now `localhost:7860` reaches the service on the SSH server, while Pi's file and shell tools remain local. This is ideal for a remote model server paired with a local UI or client repository.
-
-Stop the tunnels with:
-
-```text
-/remote unforward
-```
+`/remote forward` starts the focused project's saved `forwards` (or the mappings you pass). Forwards belong to the project's connection and never change the focus, so after `/remote focus local` `localhost:7860` still reaches the service on the SSH server while Pi's file and shell tools work on the local repository. Disconnecting the project, or `/remote unforward`, stops them.
 
 ### 5. Ask Pi directly
 
 ```text
-Connect to my configured remote, switch to /srv/api, and inspect its Git status.
+Connect to the staging project, switch to /srv/api, and inspect its Git status.
 ```
 
 ```text
-Add the note "production read-only" to this endpoint and tell me which remote
-workspace is active.
+Save a project named prod-readonly for ssh deploy@prod.example.com in /srv/api
+with the note "production, read-only", then focus it.
 ```
 
 ```text
@@ -204,45 +198,65 @@ tools on the local repository.
 
 | Command | Purpose |
 |---|---|
-| `/remote ssh USER@HOST -p PORT [-i KEY]` | Save, select, and connect using SSH config, agent, key files, or password |
-| `/remote` | Connect to the selected endpoint or prompt for one |
-| `/remote config` | List saved endpoints and settings |
-| `/remote use USER@HOST:PORT` | Select a saved endpoint |
-| `/remote config note TEXT` | Persist a note for the selected endpoint |
-| `/remote config note --clear` | Clear its note |
-| `/remote memory` | List the current server's memory entries and IDs |
-| `/remote config cwd PATH` | Persist its default remote working directory |
-| `/remote cd PATH` | Change the connected remote cwd and persist it |
-| `/remote config forward MAPPING...` | Persist port forwards such as `7860:127.0.0.1:7860` |
-| `/remote forward [MAPPING...]` | Start tunnels and keep Pi's tools local |
-| `/remote unforward` | Stop extension-managed tunnels |
-| `/remote exec COMMAND` | Run one command in the remote cwd |
-| `/remote exec --timeout 60 COMMAND` | Override the command timeout |
-| `/remote exec --lines 20 COMMAND` | Override collapsed preview lines |
+| `/remote` / `/remote list` | List saved projects (name, ssh, cwd, state, note) and the current focus, as copyable text |
+| `/remote add NAME SSH CWD [NOTE...]` | Save a project; quote a full ssh command or pass a bare target |
+| `/remote edit NAME key=value...` | Change `ssh`, `cwd`, `note`, `guard`, `local`, or `forwards`; `key=` clears an optional field |
+| `/remote remove NAME` | Delete a saved project (its memory file is kept) |
+| `/remote connect NAME` | Connect a project (exact name) and focus it |
+| `/remote focus NAME\|local` | Send tools to a session project or back to local; a disconnected session project is reconnected |
+| `/remote disconnect [NAME]` | Disconnect a project (default: the focused one); focus returns to local if it was focused |
+| `/remote status` | Show the focus and the session's projects |
+| `/remote memory [NAME]` | Show a project's memory entries, IDs, and file |
+| `/remote cd PATH` | Change the focused project's working directory for this session |
+| `/remote exec [--timeout S] [--lines N] COMMAND` | Run one command in the focused project |
+| `/remote forward [MAPPING...]` | Forward local ports to the focused project's network (default: its saved `forwards`) |
+| `/remote unforward` | Stop extension-managed forwards (the focused project's, or all when the focus is local) |
+| `/remote forget [NAME]` | Disconnect and clear cached passwords and key passphrases for the project's hops |
+| `/remote ssh ARGS...` | Quick path: find or create a project for `ssh ARGS...` (cwd `~`) and connect |
+| `/remote config` | Show output limits, display lines, and the config path |
 | `/remote config display-lines 10` | Set default collapsed preview lines (maximum 50) |
-| `/remote config read-max-lines 400` | Set the remote read line budget |
-| `/remote config read-max-bytes 16384` | Set the remote read byte budget |
-| `/remote config exec-max-lines 200` | Set the remote command line budget |
-| `/remote config exec-max-bytes 8192` | Set the remote command byte budget |
+| `/remote config read-max-lines 400` / `read-max-bytes 16384` | Set the remote read budgets |
+| `/remote config exec-max-lines 200` / `exec-max-bytes 8192` | Set the remote command budgets |
 | `/remote config turn-max-bytes 32768` | Set the aggregate per-turn remote output budget |
-| `/remote status` | Show connection state, full SSH command, and working directory |
-| `/remote reload` / `/remote reconnect` | Reconnect the saved workspace, including after disconnect |
-| `/remote disconnect` | Disconnect and return tools to local execution |
-| `/remote forget` | Disconnect and clear cached passwords and key passphrases |
+
+Project names use lowercase letters, digits, `.`, `_`, and `-` (up to 64 characters, starting with a letter or digit); `local` is reserved. `guard` (`readonly` or `confirm`) and `local` (a local checkout path) are recorded and shown to the agent and in listings; enforcing guards is planned for a later release.
+
+### The `remote` tool
+
+The agent uses one tool with these actions: `list`, `add`, `edit`, `remove`, `connect`, `disconnect`, `focus`, `status`, `chdir`, `memory`, `forward`, `unforward`, `exec`, and `forget`. `connect` needs the exact project name; an unknown name returns a short list of similar saved projects. `remove` is only for explicit user requests. Passwords and key passphrases are never accepted as arguments.
 
 ### Slash-command completion
 
-`/remote` supports Pi argument completion. Try typing a partial subcommand like `/remote sta` to complete `status`, or `/remote use ` to choose from saved endpoints.
+`/remote` supports Pi argument completion. Try `/remote sta` to complete `status`, or `/remote connect ` to choose from saved project names.
 
 ## Persistence, output, and security
 
-Endpoint configuration is stored locally in:
+Remote projects are stored locally in:
 
 ```text
 ~/.pi/agent/ssh-remote-config.json
 ```
 
-Saved global values include endpoints, active endpoint, notes, remote working directories, forwards, identity file paths, preview settings, and model-output budgets. Each Pi session also stores non-secret SSH workspace metadata so `/resume` can restore the server associated with that session. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
+```json
+{
+  "version": 2,
+  "projects": {
+    "befaq-prod": {
+      "ssh": "ssh befaq-prod",
+      "cwd": "/opt/wifaq-production",
+      "note": "Production",
+      "guard": "readonly",
+      "local": "/home/me/wifaqdrf",
+      "forwards": ["8080:127.0.0.1:80"]
+    }
+  },
+  "displayLines": 5
+}
+```
+
+`ssh` and `cwd` are required (`cwd` may be `~`); the other project fields are optional. The same file holds the preview setting and model-output budgets. Each Pi session also stores non-secret metadata (the focus and the session's projects with their current directories), so `/resume` can list them; it never reconnects by itself. Private key contents, passwords, and key passphrases are **never written to this file**. Private keys are read locally only when connecting; prompted passwords and passphrases remain only in process memory.
+
+**Upgrading from 0.1.x:** the first start rewrites the old endpoint-based file in this shape. The original is copied to `ssh-remote-config.v1.backup.json` (only if that backup does not exist yet), each endpoint becomes one project named after its ssh alias (`ssh befaq-prod` becomes `befaq-prod`) or `user-host`, the active endpoint is dropped, and per-host memory is copied into `ssh-remote-memories/projects/NAME.json` (old files are left in place). A file that cannot be parsed is never overwritten.
 
 New or changed host keys require interactive confirmation and are stored separately from OpenSSH. By default, remote text reads return at most 400 lines or 16 KB, remote command results return the last 200 lines or 8 KB, and all remote tools in one agent turn share a 32 KB output budget. Text reads support `offset`/`limit` continuation without downloading the complete remote file. Oversized command output is streamed to a permission-restricted temporary local file rather than accumulated in memory. Configured limits may be raised only to the extension's hard safety ceilings. Preview-line settings affect only the collapsed UI and never increase model output.
 

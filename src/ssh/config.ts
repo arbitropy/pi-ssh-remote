@@ -165,3 +165,8 @@ export function parseSshCommand(command: string): ParsedSsh {
 export function cacheId(config: ParsedSsh): string {
   return `${config.username}@${config.host}:${config.port}`;
 }
+
+/** Host identity for connection pooling: like cacheId, but a different jump chain is a different route. */
+export function poolKey(config: ParsedSsh): string {
+  return config.jumps?.length ? `${cacheId(config)} via ${config.jumps.map(cacheId).join(" > ")}` : cacheId(config);
+}

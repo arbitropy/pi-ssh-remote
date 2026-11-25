@@ -8,11 +8,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Added
 
-- None.
+- Added a global catalog of named remote projects (`ssh`, `cwd`, and optional `note`, `guard`, `local`, `forwards`) that is shared by every session and independent of the local folder Pi runs in. Manage it with `/remote add NAME SSH CWD [NOTE...]`, `/remote edit NAME key=value...`, `/remote remove NAME`, and the `remote` tool's `list`, `add`, `edit`, and `remove` actions. `guard` and `local` are stored and displayed only; enforcement is planned for a later release.
+- Added a per-session focus (`local` or a session project) and a connection pool. `/remote connect NAME` (exact name; unknown names list up to five similar saved projects), `/remote focus NAME|local`, `/remote disconnect [NAME]`, and the matching `remote` actions switch where `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and `!` commands run. Projects on the same host (including the same jump chain) share one SSH connection.
+- Added `/remote list`, `/remote ssh ARGS...` (finds or creates a project, then connects), and `/remote memory [NAME]`; completion now suggests subcommands and saved project names.
+- Added per-project memory files at `ssh-remote-memories/projects/NAME.json`; only the focused remote project's memory is injected, and the memory-management instructions are shorter.
 
 ### Changed
 
-- None.
+- Replaced the single-endpoint model with projects. The configuration file is now `{"version": 2, "projects": {...}}`. On first start an existing file is migrated: it is copied to `ssh-remote-config.v1.backup.json` (when that backup does not exist), each endpoint becomes one project named after its ssh alias or `user-host`, the active endpoint is dropped, and per-host memory (including legacy `serverMemories`) is copied into project memory files. Old memory files are kept. A configuration file that cannot be parsed is never overwritten.
+- Changed session handling: `/resume` and startup restore the session's project list with every project disconnected and the focus on local, and never connect on their own. `/reload`, `/new`, and forks reconnect the projects that were connected, and restore the focus, only in the interactive TUI. Session state is stored as version 2 entries; version 1 entries are mapped to saved projects.
+- Changed `/remote connect`, `focus`, `chdir`, and `/remote cd` so they affect only the session: the working directory is the session's current directory, not the saved project directory. Port forwards belong to a project and no longer change tool routing.
+- Routed tools now fail with `Remote project X is not connected; ...` when the focused project is not connected (for example after a drop that cannot be reconnected) instead of running locally.
+- Replaced the `<ssh_remote_connection>` and `<ssh_remote_workspace>` prompt sections with one short `<ssh_remote>` section listing the focus, the session's projects, and how many more are saved. Shortened the `remote` tool description and guidelines; the `command` parameter is now `ssh`, and `name`, `guard`, and `local` were added.
+
+### Removed
+
+- Removed `/remote use`, `/remote config note|cwd|forward`, `/remote reload`/`reconnect`, and the `off`/`exit` aliases, plus the `remote` tool's `note` (use `edit`) and `reconnect` (use `connect`) actions. The active-endpoint concept and tunnel-only routing mode are gone.
 
 ### Fixed
 

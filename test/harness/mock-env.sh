@@ -289,7 +289,7 @@ ENV
 }
 
 cmd_reset_state() {
-  rm -rf "$ROOT/agent/ssh-remote-config.json" "$ROOT/agent/ssh-remote-memories" "$ROOT/agent/sessions"
+  rm -rf "$ROOT/agent/ssh-remote-config.json" "$ROOT/agent/ssh-remote-config.v1.backup.json" "$ROOT/agent/ssh-remote-memories" "$ROOT/agent/sessions"
   echo "extension state reset in $ROOT/agent"
 }
 
